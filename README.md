@@ -4,7 +4,7 @@
   <img src="https://github.com/ttab/elephant-replicant/raw/main/docs/elephant-replicant.png?raw=true" width="256" alt="Elephant Replicant">
 </p>
 
-Replicates data to another Elephant environment. The replicant uses optimistic locking to prevent overwrites of documents or statuses that have been modified in the destination. 
+Replicates data to another Elephant environment. The replicant uses optimistic locking to prevent overwrites of documents that have been modified in the destination. This is not replication as a method of providing a backup or standby instance, rather it's a solution for keeping a stage or QA environment updated with relevant data.
 
 ACL:s will always be replicated.
 

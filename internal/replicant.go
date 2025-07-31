@@ -37,7 +37,6 @@ type Parameters struct {
 	IgnoreSubs         []string
 	IncludeAttachments []AttachmentRef
 	AllAttachments     bool
-	StartEvent         int64
 }
 
 type AttachmentRef struct {
@@ -73,7 +72,7 @@ func Run(ctx context.Context, p Parameters) error {
 		return fmt.Errorf("load log state: %w", err)
 	}
 
-	state.Position = min(state.Position, p.MinEventID)
+	state.Position = max(state.Position, p.MinEventID)
 
 	logMetrics, err := koonkie.NewPrometheusFollowerMetrics(
 		p.MetricsRegisterer, "replicant_follower")
@@ -346,6 +345,7 @@ func (a *Application) handleEvent(
 			ID:            docUUID,
 			SourceVersion: evt.Version,
 			TargetVersion: upRes.Version,
+			Created:       pg.Time(time.Now()),
 		})
 		if err != nil {
 			return 0, fmt.Errorf("record new version mapping: %w", err)

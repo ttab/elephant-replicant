@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/internal"
 	"github.com/ttab/elephantine"
@@ -54,7 +55,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:    "db",
-				Value:   "postgres://elephant-replicant:pass@localhost/follower",
+				Value:   "postgres://elephant-replicant:pass@localhost/elephant-replicant",
 				EnvVars: []string{"CONN_STRING"},
 			},
 			&cli.StringSliceFlag{
@@ -88,7 +89,7 @@ func main() {
 			},
 			&cli.Int64Flag{
 				Name:    "start-event",
-				EnvVars: []string{"Start_EVENT"},
+				EnvVars: []string{"START_EVENT"},
 				Usage:   "The event to start replication at",
 			},
 			&cli.StringFlag{
@@ -238,7 +239,9 @@ func runReplicant(c *cli.Context) error {
 		IgnoreSubs:         ignoreSubs,
 		IncludeAttachments: incAttachments,
 		AllAttachments:     allAttachments,
-		StartEvent:         startEvent,
+		MinEventID:         startEvent,
+		MetricsRegisterer:  prometheus.DefaultRegisterer,
+		AuthInfoParser:     auth.AuthParser,
 	})
 	if err != nil {
 		return fmt.Errorf("run application: %w", err)
