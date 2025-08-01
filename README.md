@@ -15,7 +15,6 @@ Attachments will only be replicated if `-all-attachments` is set or if they have
 ``` shell
 IGNORE_TYPES=core/article+meta,tt/wire,tt/wire-provider,tt/wire-source
 IGNORE_SUBS=core://application/elephant-wires
-IGNORE_CREATORS=core://application/elephant-wires
 INCLUDE_ATTACHMENTS=image.core/image,layout.tt/print-layout
 #ALL_ATTACHMENTS=true
 START_EVENT=4000000

@@ -29,3 +29,16 @@ ON CONFLICT (id, source_version) DO UPDATE
 SELECT target_version
 FROM version_mapping
 WHERE id = @id AND source_version = @source_version;
+
+-- name: RemoveOldMappings :exec
+DELETE FROM version_mapping
+WHERE created < @cutoff;
+
+-- name: RemoveDocument :exec
+DELETE FROM document WHERE id = @id;
+
+-- name: RemoveDocumentVersionMappings :exec
+DELETE FROM version_mapping
+WHERE id = @id;
+
+

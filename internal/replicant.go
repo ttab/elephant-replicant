@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,11 +35,15 @@ type Parameters struct {
 	AuthInfoParser     elephantine.AuthInfoParser
 	CORSHosts          []string
 	IgnoreTypes        []string
-	IgnoreCreators     []string
 	IgnoreSubs         []string
 	IncludeAttachments []AttachmentRef
 	AllAttachments     bool
 }
+
+var (
+	ErrSkipped  = errors.New("skipped event")
+	ErrConflict = errors.New("document has been updated in target")
+)
 
 type AttachmentRef struct {
 	DocType string
@@ -116,6 +122,10 @@ func Run(ctx context.Context, p Parameters) error {
 		return p.Server.ListenAndServe(grace.CancelOnQuit(ctx))
 	})
 
+	group.Go("cleanup", func(ctx context.Context) error {
+		return app.mappingCleanup(grace.CancelOnStop(ctx))
+	})
+
 	return group.Wait()
 }
 
@@ -150,16 +160,34 @@ func (a *Application) Replicate(ctx context.Context) error {
 		}
 
 		for _, item := range items {
+
 			pos = item.Id
 
-			_, err := a.handleEvent(ctx, item, caughtUp)
-			if errors.Is(err, ErrSkipped) {
+			if item.Event == "workflow" {
+				// Workflows describes effects rather than changes.
 				continue
-			} else if err != nil {
-				return fmt.Errorf("handle event %d: %w", item.Id, err)
 			}
 
-			lastSaved = pos
+			err := a.handleEvent(ctx, item, caughtUp)
+			switch {
+			case errors.Is(err, ErrSkipped):
+				a.p.Logger.Debug("skipped import of document",
+					elephantine.LogKeyEventID, item.Id,
+					elephantine.LogKeyEventType, item.Event,
+					elephantine.LogKeyDocumentUUID, item.Uuid,
+				)
+			case errors.Is(err, ErrConflict):
+				a.p.Logger.Info("conflict with change in target repo",
+					elephantine.LogKeyEventID, item.Id,
+					elephantine.LogKeyEventType, item.Event,
+					elephantine.LogKeyDocumentUUID, item.Uuid,
+				)
+			case err != nil:
+				return fmt.Errorf("handle event %d (%s): %w",
+					item.Id, item.Uuid, err)
+			default:
+				lastSaved = pos
+			}
 		}
 
 		if lastSaved != pos {
@@ -176,24 +204,25 @@ func (a *Application) Replicate(ctx context.Context) error {
 
 func (a *Application) handleEvent(
 	ctx context.Context, evt *repository.EventlogItem, caughtUp bool,
-) (_ int64, outErr error) {
+) (outErr error) {
 	docUUID := uuid.MustParse(evt.Uuid)
 
-	if evt.Event == "workflow" {
-		return 0, ErrSkipped
-	}
-
 	if slices.Contains(a.p.IgnoreSubs, evt.UpdaterUri) {
-		return 0, ErrSkipped
+		return ErrSkipped
 	}
 
 	if slices.Contains(a.p.IgnoreTypes, evt.Type) {
-		return 0, ErrSkipped
+		return ErrSkipped
+	}
+
+	// Separate handling of deletes.
+	if evt.Type == "delete_document" {
+		return a.handleDeleteEvent(ctx, evt, docUUID)
 	}
 
 	tx, err := a.p.Database.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("begin transaction: %w", err)
+		return fmt.Errorf("begin transaction: %w", err)
 	}
 
 	defer pg.Rollback(tx, &outErr)
@@ -206,7 +235,7 @@ func (a *Application) handleEvent(
 	if errors.Is(err, pgx.ErrNoRows) {
 		isNew = true
 	} else if err != nil {
-		return 0, fmt.Errorf("get current target version: %w", err)
+		return fmt.Errorf("get current target version: %w", err)
 	}
 
 	update := repository.UpdateRequest{
@@ -230,18 +259,27 @@ func (a *Application) handleEvent(
 			})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return 0, ErrSkipped
+			return ErrSkipped
 		} else if err != nil {
-			return 0, fmt.Errorf("get source meta: %w", err)
+			return fmt.Errorf("get source meta: %w", err)
 		}
 
 		evt.Version = metaRes.Meta.CurrentVersion
-		update.Acl = metaRes.Meta.Acl
 
-		// Replace import directive with original creation info.
-		update.ImportDirective = &repository.ImportDirective{
-			OriginallyCreated: metaRes.Meta.Created,
-			OriginalCreator:   metaRes.Meta.CreatorUri,
+		// Replace import directive with original creation info and set
+		// ACLs on first ingest of the document. Also grab attachments
+		// on first encounter.
+		if isNew {
+			update.Acl = metaRes.Meta.Acl
+
+			update.ImportDirective = &repository.ImportDirective{
+				OriginallyCreated: metaRes.Meta.Created,
+				OriginalCreator:   metaRes.Meta.CreatorUri,
+			}
+
+			for _, info := range metaRes.Meta.Attachments {
+				evt.AttachedObjects = append(evt.AttachedObjects, info.Name)
+			}
 		}
 
 		for status, info := range metaRes.Meta.Heads {
@@ -269,12 +307,17 @@ func (a *Application) handleEvent(
 			})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return 0, ErrSkipped
+			return ErrSkipped
 		} else if err != nil {
-			return 0, fmt.Errorf("get source document: %w", err)
+			return fmt.Errorf("get source document: %w", err)
 		}
 
 		update.Document = docRes.Document
+
+		err = a.prepareAttachments(ctx, evt, &update)
+		if err != nil {
+			return fmt.Errorf("transfer attachments: %w", err)
+		}
 	case "status":
 		mappedVersion, err := q.GetTargetVersion(ctx,
 			postgres.GetTargetVersionParams{
@@ -283,7 +326,7 @@ func (a *Application) handleEvent(
 			})
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No record of the version that the status refers to, skip.
-			return 0, ErrSkipped
+			return ErrSkipped
 		}
 
 		statusRes, err := a.p.Documents.GetStatus(ctx, &repository.GetStatusRequest{
@@ -293,9 +336,9 @@ func (a *Application) handleEvent(
 		})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return 0, ErrSkipped
+			return ErrSkipped
 		} else if err != nil {
-			return 0, fmt.Errorf("get source status: %w", err)
+			return fmt.Errorf("get source status: %w", err)
 		}
 
 		update.Status = append(update.Status, &repository.StatusUpdate{
@@ -310,14 +353,14 @@ func (a *Application) handleEvent(
 			})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return 0, ErrSkipped
+			return ErrSkipped
 		} else if err != nil {
-			return 0, fmt.Errorf("get source meta: %w", err)
+			return fmt.Errorf("get source meta: %w", err)
 		}
 
 		update.Acl = metaRes.Meta.Acl
 	default:
-		return 0, ErrSkipped
+		return ErrSkipped
 	}
 
 	// We just let new documents overwrite whatever is there.
@@ -327,9 +370,9 @@ func (a *Application) handleEvent(
 
 	upRes, err := a.p.TargetDocuments.Update(ctx, &update)
 	if elephantine.IsTwirpErrorCode(err, twirp.FailedPrecondition) {
-		return 0, ErrConflict
+		return ErrConflict
 	} else if err != nil {
-		return 0, fmt.Errorf("update target: %w", err)
+		return fmt.Errorf("update target: %w", err)
 	}
 
 	if updateType == "document" {
@@ -338,7 +381,7 @@ func (a *Application) handleEvent(
 			TargetVersion: upRes.Version,
 		})
 		if err != nil {
-			return 0, fmt.Errorf("record new target version: %w", err)
+			return fmt.Errorf("record new target version: %w", err)
 		}
 
 		err = q.AddVersionMapping(ctx, postgres.AddVersionMappingParams{
@@ -348,7 +391,7 @@ func (a *Application) handleEvent(
 			Created:       pg.Time(time.Now()),
 		})
 		if err != nil {
-			return 0, fmt.Errorf("record new version mapping: %w", err)
+			return fmt.Errorf("record new version mapping: %w", err)
 		}
 	}
 
@@ -357,18 +400,188 @@ func (a *Application) handleEvent(
 		CaughtUp: caughtUp,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("persist log state: %w", err)
+		return fmt.Errorf("persist log state: %w", err)
 	}
 
 	err = tx.Commit(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("commit state: %w", err)
+		return fmt.Errorf("commit state: %w", err)
 	}
 
-	return upRes.Version, nil
+	return nil
 }
 
-var (
-	ErrSkipped  = errors.New("skipped event")
-	ErrConflict = errors.New("document has been updated in target")
-)
+func (a *Application) prepareAttachments(
+	ctx context.Context,
+	evt *repository.EventlogItem,
+	request *repository.UpdateRequest,
+) error {
+	if len(evt.AttachedObjects) == 0 {
+		return nil
+	}
+
+	request.AttachObjects = make(map[string]string)
+
+	for _, name := range evt.AttachedObjects {
+		if !a.shouldReplicateAttachment(name, evt.Type) {
+			continue
+		}
+
+		attachments, err := a.p.Documents.GetAttachments(ctx, &repository.GetAttachmentsRequest{
+			AttachmentName: name,
+			Documents:      []string{evt.Uuid},
+			DownloadLink:   true,
+		})
+		if err != nil {
+			return fmt.Errorf("get download link for %q: %w", name, err)
+		}
+
+		if len(attachments.Attachments) == 0 {
+			// Ignore attachments if they have been deleted.
+			continue
+		}
+
+		obj := attachments.Attachments[0]
+
+		uploadID, err := a.transferAttachment(ctx, evt, request, obj)
+		if err != nil {
+			return fmt.Errorf("transfer %q: %w", name, err)
+		}
+
+		request.AttachObjects[name] = uploadID
+	}
+
+	return nil
+}
+
+func (a *Application) transferAttachment(
+	ctx context.Context,
+	evt *repository.EventlogItem,
+	request *repository.UpdateRequest,
+	obj *repository.AttachmentDetails,
+) (_ string, outErr error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, obj.DownloadLink, nil)
+	if err != nil {
+		return "", fmt.Errorf("create download request: %w", err)
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("make download request: %w", err)
+	}
+
+	defer elephantine.Close("download body", res.Body, &outErr)
+
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf(
+			"failed to download attachment, server responded with: %s",
+			res.Status)
+	}
+
+	upload, err := a.p.TargetDocuments.CreateUpload(ctx, &repository.CreateUploadRequest{
+		Name:        obj.Filename,
+		ContentType: obj.ContentType,
+		// TODO: No meta in AttachmentDetails?
+	})
+	if err != nil {
+		return "", fmt.Errorf("create upload: %w", err)
+	}
+
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		upload.Url, res.Body)
+	if err != nil {
+		return "", fmt.Errorf("create upload request: %w", err)
+	}
+
+	upReq.ContentLength = res.ContentLength
+	upReq.Header.Add("Content-Type", obj.ContentType)
+
+	upRes, err := http.DefaultClient.Do(upReq)
+	if err != nil {
+		return "", fmt.Errorf("make upload request: %w", err)
+	}
+
+	defer elephantine.Close("upload body", upRes.Body, &outErr)
+
+	if upRes.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to upload attachment, server responded with: %s",
+			res.Status)
+	}
+
+	return upload.Id, nil
+}
+
+func (a *Application) shouldReplicateAttachment(name string, docType string) bool {
+	if a.p.AllAttachments {
+		return true
+	}
+
+	for _, r := range a.p.IncludeAttachments {
+		if name == r.Name && docType == r.DocType {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (a *Application) handleDeleteEvent(
+	ctx context.Context, evt *repository.EventlogItem, docUUID uuid.UUID,
+) (outErr error) {
+	tx, err := a.p.Database.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	defer pg.Rollback(tx, &outErr)
+
+	q := postgres.New(tx)
+
+	err = q.RemoveDocument(ctx, docUUID)
+	if err != nil {
+		return fmt.Errorf("remove document target entry: %w", err)
+	}
+
+	err = q.RemoveDocumentVersionMappings(ctx, docUUID)
+	if err != nil {
+		return fmt.Errorf("remove document version mappings: %w", err)
+	}
+
+	_, err = a.p.TargetDocuments.Delete(ctx, &repository.DeleteDocumentRequest{
+		Uuid: evt.Uuid,
+		Meta: map[string]string{
+			"original_delete_record": strconv.FormatInt(evt.DeleteRecordId, 10),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("delete document: %w", err)
+	}
+
+	err = tx.Commit(ctx)
+	if err != nil {
+		return fmt.Errorf("commit state: %w", err)
+	}
+
+	return nil
+}
+
+func (a *Application) mappingCleanup(ctx context.Context) error {
+	for {
+		run := time.After(1 * time.Hour)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-run:
+		}
+
+		q := postgres.New(a.p.Database)
+
+		// Remove mappings older than six months.
+		err := q.RemoveOldMappings(ctx, pg.Time(
+			time.Now().AddDate(0, -6, 0)))
+		if err != nil {
+			return fmt.Errorf("remove old mappings: %w", err)
+		}
+	}
+}

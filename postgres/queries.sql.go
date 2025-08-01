@@ -79,6 +79,35 @@ func (q *Queries) GetTargetVersion(ctx context.Context, arg GetTargetVersionPara
 	return target_version, err
 }
 
+const removeDocument = `-- name: RemoveDocument :exec
+DELETE FROM document WHERE id = $1
+`
+
+func (q *Queries) RemoveDocument(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, removeDocument, id)
+	return err
+}
+
+const removeDocumentVersionMappings = `-- name: RemoveDocumentVersionMappings :exec
+DELETE FROM version_mapping
+WHERE id = $1
+`
+
+func (q *Queries) RemoveDocumentVersionMappings(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, removeDocumentVersionMappings, id)
+	return err
+}
+
+const removeOldMappings = `-- name: RemoveOldMappings :exec
+DELETE FROM version_mapping
+WHERE created < $1
+`
+
+func (q *Queries) RemoveOldMappings(ctx context.Context, cutoff pgtype.Timestamptz) error {
+	_, err := q.db.Exec(ctx, removeOldMappings, cutoff)
+	return err
+}
+
 const setDocumentVersion = `-- name: SetDocumentVersion :exec
 INSERT INTO document(id, target_version)
 VALUES($1, $2)
