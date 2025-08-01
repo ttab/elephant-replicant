@@ -124,8 +124,8 @@ func main() {
 }
 
 var (
-	source_scopes = []string{"doc_read_all", "eventlog_read"}
-	target_scopes = []string{"doc_admin"}
+	sourceScopes = []string{"doc_read_all", "eventlog_read"}
+	targetScopes = []string{"doc_admin"}
 )
 
 func runReplicant(c *cli.Context) error {
@@ -191,7 +191,7 @@ func runReplicant(c *cli.Context) error {
 		return fmt.Errorf("connect to database: %w", err)
 	}
 
-	auth, err := elephantine.AuthenticationConfigFromCLI(c, source_scopes)
+	auth, err := elephantine.AuthenticationConfigFromCLI(c, sourceScopes)
 	if err != nil {
 		return fmt.Errorf("set up authentication: %w", err)
 	}
@@ -201,7 +201,7 @@ func runReplicant(c *cli.Context) error {
 		return fmt.Errorf("verify credentials: %w", err)
 	}
 
-	targetAuth, err := targetAuthentication(c, target_scopes)
+	targetAuth, err := targetAuthentication(c, targetScopes)
 	if err != nil {
 		return fmt.Errorf("set up authentication: %w", err)
 	}
@@ -264,5 +264,5 @@ func targetAuthentication(c *cli.Context, scopes []string) (*elephantine.Authent
 		}
 	}
 
-	return elephantine.AuthenticationConfigFromCLI(c, scopes)
+	return elephantine.AuthenticationConfigFromCLI(c, scopes) //nolint: wrapcheck
 }

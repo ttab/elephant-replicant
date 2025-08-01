@@ -126,7 +126,7 @@ func Run(ctx context.Context, p Parameters) error {
 		return app.mappingCleanup(grace.CancelOnStop(ctx))
 	})
 
-	return group.Wait()
+	return group.Wait() //nolint: wrapcheck
 }
 
 var _ replicant.Replication = &Application{}
@@ -138,7 +138,7 @@ type Application struct {
 
 // SendDocument implements replicant.Replication.
 func (a *Application) SendDocument(
-	ctx context.Context, req *replicant.SendDocumentRequest,
+	ctx context.Context, _ *replicant.SendDocumentRequest,
 ) (*replicant.SendDocumentResponse, error) {
 	_, err := elephantine.RequireAnyScope(ctx, "doc_admin", "doc_write")
 	if err != nil {
@@ -147,6 +147,15 @@ func (a *Application) SendDocument(
 
 	return nil, twirp.NewError(twirp.Unimplemented, "soon")
 }
+
+const (
+	TypeDocumentVersion = "document"
+	TypeNewStatus       = "status"
+	TypeACLUpdate       = "acl"
+	TypeDeleteDocument  = "delete_document"
+	TypeRestoreFinished = "restore_finished"
+	TypeWorkflow        = "workflow"
+)
 
 func (a *Application) Replicate(ctx context.Context) error {
 	for {
@@ -160,10 +169,9 @@ func (a *Application) Replicate(ctx context.Context) error {
 		}
 
 		for _, item := range items {
-
 			pos = item.Id
 
-			if item.Event == "workflow" {
+			if item.Event == TypeWorkflow {
 				// Workflows describes effects rather than changes.
 				continue
 			}
@@ -218,7 +226,7 @@ func (a *Application) handleEvent(
 	}
 
 	// Separate handling of deletes.
-	if evt.Type == "delete_document" {
+	if evt.Type == TypeDeleteDocument {
 		return a.handleDeleteEvent(ctx, evt, docUUID)
 	}
 
@@ -253,7 +261,7 @@ func (a *Application) handleEvent(
 	if !caughtUp {
 		// If we're not caught up we might just get one event per
 		// document, so we'll need to fill in the blanks here.
-		updateType = "document"
+		updateType = TypeDocumentVersion
 
 		metaRes, err := a.p.Documents.GetMeta(ctx,
 			&repository.GetMetaRequest{
@@ -301,7 +309,7 @@ func (a *Application) handleEvent(
 	}
 
 	switch updateType {
-	case "document":
+	case TypeDocumentVersion:
 		docRes, err := a.p.Documents.Get(ctx,
 			&repository.GetDocumentRequest{
 				Uuid:    evt.Uuid,
@@ -320,7 +328,7 @@ func (a *Application) handleEvent(
 		if err != nil {
 			return fmt.Errorf("transfer attachments: %w", err)
 		}
-	case "status":
+	case TypeNewStatus:
 		mappedVersion, err := q.GetTargetVersion(ctx,
 			postgres.GetTargetVersionParams{
 				ID:            docUUID,
@@ -348,7 +356,7 @@ func (a *Application) handleEvent(
 			Version: mappedVersion,
 			Meta:    statusRes.Status.Meta,
 		})
-	case "acl":
+	case TypeACLUpdate:
 		metaRes, err := a.p.Documents.GetMeta(ctx,
 			&repository.GetMetaRequest{
 				Uuid: evt.Uuid,
@@ -378,7 +386,7 @@ func (a *Application) handleEvent(
 		return fmt.Errorf("update target: %w", err)
 	}
 
-	if updateType == "document" {
+	if updateType == TypeDocumentVersion {
 		err = q.SetDocumentVersion(ctx, postgres.SetDocumentVersionParams{
 			ID:            docUUID,
 			TargetVersion: upRes.Version,
@@ -446,7 +454,7 @@ func (a *Application) prepareAttachments(
 
 		obj := attachments.Attachments[0]
 
-		uploadID, err := a.transferAttachment(ctx, evt, request, obj)
+		uploadID, err := a.transferAttachment(ctx, obj)
 		if err != nil {
 			return fmt.Errorf("transfer %q: %w", name, err)
 		}
@@ -459,8 +467,6 @@ func (a *Application) prepareAttachments(
 
 func (a *Application) transferAttachment(
 	ctx context.Context,
-	evt *repository.EventlogItem,
-	request *repository.UpdateRequest,
 	obj *repository.AttachmentDetails,
 ) (_ string, outErr error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, obj.DownloadLink, nil)
@@ -468,7 +474,7 @@ func (a *Application) transferAttachment(
 		return "", fmt.Errorf("create download request: %w", err)
 	}
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := http.DefaultClient.Do(req) //nolint: bodyclose
 	if err != nil {
 		return "", fmt.Errorf("make download request: %w", err)
 	}
@@ -499,7 +505,7 @@ func (a *Application) transferAttachment(
 	upReq.ContentLength = res.ContentLength
 	upReq.Header.Add("Content-Type", obj.ContentType)
 
-	upRes, err := http.DefaultClient.Do(upReq)
+	upRes, err := http.DefaultClient.Do(upReq) //nolint: bodyclose
 	if err != nil {
 		return "", fmt.Errorf("make upload request: %w", err)
 	}
@@ -574,7 +580,7 @@ func (a *Application) mappingCleanup(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return ctx.Err() //nolint: wrapcheck
 		case <-run:
 		}
 

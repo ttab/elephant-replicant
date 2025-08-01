@@ -1,0 +1,77 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - dogsled
+    - dupl
+    - errorlint
+    - exhaustive
+    - forbidigo
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - godot
+    - godox
+    - goheader
+    - gomoddirectives
+    - gomodguard
+    - goprintffuncname
+    - gosec
+    - importas
+    - lll
+    - makezero
+    - misspell
+    - nakedret
+    - nestif
+    - nilnil
+    - nlreturn
+    - nolintlint
+    - predeclared
+    - promlinter
+    - revive
+    - staticcheck
+    - testpackage
+    - thelper
+    - unconvert
+    - unparam
+    - usetesting
+    - whitespace
+    - wrapcheck
+    - wsl_v5
+  settings:
+    godox:
+      keywords:
+        - FIXME
+        - BUG
+    nestif:
+      min-complexity: 6
+    wrapcheck:
+      extra-ignore-sigs:
+        - elephantine.InvalidArgumentf(
+        - elephantine.RequireAnyScope(
+        - howdah.NewHTTPError
+        - howdah.HTTPErrorf
+        - .RequireAuth(
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
