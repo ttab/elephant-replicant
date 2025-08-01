@@ -175,12 +175,14 @@ func (a *Application) Replicate(ctx context.Context) error {
 					elephantine.LogKeyEventID, item.Id,
 					elephantine.LogKeyEventType, item.Event,
 					elephantine.LogKeyDocumentUUID, item.Uuid,
+					elephantine.LogKeyError, err,
 				)
 			case errors.Is(err, ErrConflict):
 				a.p.Logger.Info("conflict with change in target repo",
 					elephantine.LogKeyEventID, item.Id,
 					elephantine.LogKeyEventType, item.Event,
 					elephantine.LogKeyDocumentUUID, item.Uuid,
+					elephantine.LogKeyError, err,
 				)
 			case err != nil:
 				return fmt.Errorf("handle event %d (%s): %w",
@@ -208,11 +210,11 @@ func (a *Application) handleEvent(
 	docUUID := uuid.MustParse(evt.Uuid)
 
 	if slices.Contains(a.p.IgnoreSubs, evt.UpdaterUri) {
-		return ErrSkipped
+		return fmt.Errorf("ignored sub: %w", ErrSkipped)
 	}
 
 	if slices.Contains(a.p.IgnoreTypes, evt.Type) {
-		return ErrSkipped
+		return fmt.Errorf("ignored type: %w", ErrSkipped)
 	}
 
 	// Separate handling of deletes.
@@ -246,7 +248,7 @@ func (a *Application) handleEvent(
 		},
 	}
 
-	updateType := evt.Type
+	updateType := evt.Event
 
 	if !caughtUp {
 		// If we're not caught up we might just get one event per
@@ -259,7 +261,7 @@ func (a *Application) handleEvent(
 			})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return ErrSkipped
+			return fmt.Errorf("document not found for meta read: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get source meta: %w", err)
 		}
@@ -307,7 +309,7 @@ func (a *Application) handleEvent(
 			})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return ErrSkipped
+			return fmt.Errorf("document not found: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get source document: %w", err)
 		}
@@ -336,7 +338,7 @@ func (a *Application) handleEvent(
 		})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return ErrSkipped
+			return fmt.Errorf("document not found: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get source status: %w", err)
 		}
@@ -353,14 +355,15 @@ func (a *Application) handleEvent(
 			})
 		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
 			// Just ignore deleted documents.
-			return ErrSkipped
+			return fmt.Errorf("document not found: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get source meta: %w", err)
 		}
 
 		update.Acl = metaRes.Meta.Acl
 	default:
-		return ErrSkipped
+		return fmt.Errorf("unhandled event type %q: %w",
+			updateType, ErrSkipped)
 	}
 
 	// We just let new documents overwrite whatever is there.
