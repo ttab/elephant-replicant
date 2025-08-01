@@ -80,6 +80,9 @@ func Run(ctx context.Context, p Parameters) error {
 
 	state.Position = max(state.Position, p.MinEventID)
 
+	p.Logger.Info("starting replication",
+		elephantine.LogKeyEventID, state.Position)
+
 	logMetrics, err := koonkie.NewPrometheusFollowerMetrics(
 		p.MetricsRegisterer, "replicant_follower")
 	if err != nil {
