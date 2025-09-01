@@ -251,6 +251,14 @@ func (a *Application) handleEvent(
 		return fmt.Errorf("get current target version: %w", err)
 	}
 
+	if isNew {
+		err := a.reconcileTypeDifferences(
+			ctx, docUUID.String(), evt.Type)
+		if err != nil {
+			return fmt.Errorf("reconcile type differences for new document: %w", err)
+		}
+	}
+
 	update := repository.UpdateRequest{
 		Uuid: evt.Uuid,
 		ImportDirective: &repository.ImportDirective{
@@ -421,6 +429,37 @@ func (a *Application) handleEvent(
 	if err != nil {
 		return fmt.Errorf("commit state: %w", err)
 	}
+
+	return nil
+}
+
+func (a *Application) reconcileTypeDifferences(ctx context.Context, docUUID string, sourceType string) error {
+	docRes, err := a.p.TargetDocuments.Get(ctx, &repository.GetDocumentRequest{
+		Uuid: docUUID,
+	})
+	if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("get target document: %w", err)
+	}
+
+	if docRes.Document.Type == sourceType {
+		return nil
+	}
+
+	_, err = a.p.TargetDocuments.Delete(ctx, &repository.DeleteDocumentRequest{
+		Uuid: docUUID,
+	})
+	if err != nil {
+		return fmt.Errorf("delete target document: %w", err)
+	}
+
+	a.p.Logger.WarnContext(ctx,
+		"deleted document in target to reconcile type differences",
+		elephantine.LogKeyDocumentUUID, docUUID,
+		elephantine.LogKeyDocumentType, sourceType,
+		"old_type", docRes.Document.Type,
+	)
 
 	return nil
 }
