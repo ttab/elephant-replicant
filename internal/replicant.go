@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	rpc_newsdoc "github.com/ttab/elephant-api/newsdoc"
 	"github.com/ttab/elephant-api/replicant"
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/postgres"
@@ -36,6 +37,7 @@ type Parameters struct {
 	CORSHosts          []string
 	IgnoreTypes        []string
 	IgnoreSubs         []string
+	IgnoreSections     []string
 	IncludeAttachments []AttachmentRef
 	AllAttachments     bool
 }
@@ -96,9 +98,15 @@ func Run(ctx context.Context, p Parameters) error {
 		WaitDuration: 10 * time.Second,
 	})
 
+	cFilter, err := NewContentFilterFromParams(p)
+	if err != nil {
+		return fmt.Errorf("create content filter: %w", err)
+	}
+
 	app := Application{
-		p:  p,
-		lf: lf,
+		p:       p,
+		lf:      lf,
+		cFilter: cFilter,
 	}
 
 	opts, err := elephantine.NewDefaultServiceOptions(
@@ -135,8 +143,9 @@ func Run(ctx context.Context, p Parameters) error {
 var _ replicant.Replication = &Application{}
 
 type Application struct {
-	p  Parameters
-	lf *koonkie.LogFollower
+	p       Parameters
+	lf      *koonkie.LogFollower
+	cFilter *ContentFilter
 }
 
 // SendDocument implements replicant.Replication.
@@ -199,6 +208,12 @@ func (a *Application) Replicate(ctx context.Context) error {
 				return fmt.Errorf("handle event %d (%s): %w",
 					item.Id, item.Uuid, err)
 			default:
+				a.p.Logger.Debug("handled event",
+					elephantine.LogKeyEventID, item.Id,
+					elephantine.LogKeyEventType, item.Event,
+					elephantine.LogKeyDocumentUUID, item.Uuid,
+				)
+
 				lastSaved = pos
 			}
 		}
@@ -231,6 +246,35 @@ func (a *Application) handleEvent(
 	// Separate handling of deletes.
 	if evt.Type == TypeDeleteDocument {
 		return a.handleDeleteEvent(ctx, evt, docUUID)
+	}
+
+	var checkRes *repository.GetDocumentResponse
+
+	if a.cFilter.HasFilters(evt.Type) {
+		// Load the current document from the source to perform
+		// content-based filtering. Yes, this might evaluate a document
+		// based on another version of the document than the update
+		// concerns, but we're not aiming for perfection here.
+		res, err := a.p.Documents.Get(ctx,
+			&repository.GetDocumentRequest{
+				Uuid: evt.Uuid,
+			})
+		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+			// Just ignore deleted documents.
+			return fmt.Errorf("document not found for content filtering: %w", ErrSkipped)
+		} else if err != nil {
+			return fmt.Errorf("get document for content based filtering: %w", err)
+		}
+
+		// Squirrel away the result so that it can be re-used if the
+		// document version actually matches the one in the event.
+		checkRes = res
+
+		doc := rpc_newsdoc.DocumentFromRPC(res.Document)
+
+		if !a.cFilter.Check(doc) {
+			return fmt.Errorf("ignored because of content filter: %w", ErrSkipped)
+		}
 	}
 
 	tx, err := a.p.Database.Begin(ctx)
@@ -321,19 +365,24 @@ func (a *Application) handleEvent(
 
 	switch updateType {
 	case TypeDocumentVersion:
-		docRes, err := a.p.Documents.Get(ctx,
-			&repository.GetDocumentRequest{
-				Uuid:    evt.Uuid,
-				Version: evt.Version,
-			})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
-			// Just ignore deleted documents.
-			return fmt.Errorf("document not found: %w", ErrSkipped)
-		} else if err != nil {
-			return fmt.Errorf("get source document: %w", err)
-		}
+		// Re-use check result document if possible.
+		if checkRes != nil && checkRes.Version == evt.Version {
+			update.Document = checkRes.Document
+		} else {
+			res, err := a.p.Documents.Get(ctx,
+				&repository.GetDocumentRequest{
+					Uuid:    evt.Uuid,
+					Version: evt.Version,
+				})
+			if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+				// Just ignore deleted documents.
+				return fmt.Errorf("document not found: %w", ErrSkipped)
+			} else if err != nil {
+				return fmt.Errorf("get source document: %w", err)
+			}
 
-		update.Document = docRes.Document
+			update.Document = res.Document
+		}
 
 		err = a.prepareAttachments(ctx, evt, &update)
 		if err != nil {
@@ -390,11 +439,36 @@ func (a *Application) handleEvent(
 		update.IfMatch = targetVersion
 	}
 
-	upRes, err := a.p.TargetDocuments.Update(ctx, &update)
-	if elephantine.IsTwirpErrorCode(err, twirp.FailedPrecondition) {
-		return ErrConflict
-	} else if err != nil {
-		return fmt.Errorf("update target: %w", err)
+	var upRes *repository.UpdateResponse
+
+	// Retry loop to allow for backfill of document if it doesn't exist in
+	// the destination. F.ex. setting an ACL on a document that hasn't been
+	// created yet will result in a 404.
+	for {
+		res, err := a.p.TargetDocuments.Update(ctx, &update)
+
+		switch {
+		case elephantine.IsTwirpErrorCode(err, twirp.FailedPrecondition):
+			return ErrConflict
+		case elephantine.IsTwirpErrorCode(err, twirp.NotFound) && update.Document == nil:
+			fetchRes, err := a.p.Documents.Get(ctx,
+				&repository.GetDocumentRequest{
+					Uuid: evt.Uuid,
+				})
+			if err != nil {
+				return fmt.Errorf("fetch document for backfill: %w", err)
+			}
+
+			update.Document = fetchRes.Document
+
+			continue
+		case err != nil:
+			return fmt.Errorf("update target: %w", err)
+		}
+
+		upRes = res
+
+		break
 	}
 
 	if updateType == TypeDocumentVersion {
