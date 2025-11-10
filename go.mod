@@ -14,7 +14,7 @@ require (
 	github.com/ttab/newsdoc v0.7.4
 	github.com/twitchtv/twirp v8.1.3+incompatible
 	github.com/urfave/cli/v2 v2.27.7
-	golang.org/x/oauth2 v0.31.0
+	golang.org/x/oauth2 v0.33.0
 )
 
 require (
