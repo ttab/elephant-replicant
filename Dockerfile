@@ -11,7 +11,7 @@ ARG TARGETOS TARGETARCH
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -o /build/replicant ./cmd/replicant
 
-FROM alpine:3.22
+FROM alpine:3.23
 
 COPY --from=build /build/replicant /usr/local/bin/replicant
 
