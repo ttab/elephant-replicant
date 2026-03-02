@@ -12,6 +12,20 @@ import (
 type Document struct {
 	ID            uuid.UUID
 	TargetVersion int64
+	TargetName    string
+}
+
+type ReplicationTarget struct {
+	Name          string
+	RepositoryUrl string
+	OidcConfig    string
+	ClientID      string
+	ClientSecret  string
+	StartFrom     int64
+	Config        []byte
+	Enabled       bool
+	Created       pgtype.Timestamptz
+	Updated       pgtype.Timestamptz
 }
 
 type SchemaVersion struct {
@@ -28,4 +42,5 @@ type VersionMapping struct {
 	SourceVersion int64
 	TargetVersion int64
 	Created       pgtype.Timestamptz
+	TargetName    string
 }

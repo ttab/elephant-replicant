@@ -1,28 +1,25 @@
 package internal
 
 import (
-	"fmt"
-	"strings"
-
+	"github.com/ttab/elephant-api/replicant"
 	"github.com/ttab/newsdoc"
 )
 
-func NewContentFilterFromParams(p Parameters) (*ContentFilter, error) {
+// NewContentFilterFromSyncConfig builds a ContentFilter from the proto
+// SyncConfig type.
+func NewContentFilterFromSyncConfig(cfg *replicant.SyncConfig) (*ContentFilter, error) {
 	cf := ContentFilter{
 		types: make(map[string][]BlockFilter),
 	}
 
-	for _, exp := range p.IgnoreSections {
-		docType, sectionUUID, ok := strings.Cut(exp, ":")
-		if !ok {
-			return nil, fmt.Errorf("invalid section filter %q", exp)
-		}
+	for _, s := range cfg.GetIgnoreSections() {
+		sectionUUID := s.GetSectionUuid()
 
 		matcher := newsdoc.BlockMatchFunc(func(block newsdoc.Block) bool {
 			return block.Rel == "section" && block.UUID == sectionUUID
 		})
 
-		cf.types[docType] = append(cf.types[docType],
+		cf.types[s.GetType()] = append(cf.types[s.GetType()],
 			BlockFilter{
 				Kind:    BlockKindLink,
 				Matcher: matcher,

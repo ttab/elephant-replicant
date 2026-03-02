@@ -13,14 +13,15 @@ import (
 )
 
 const addVersionMapping = `-- name: AddVersionMapping :exec
-INSERT INTO version_mapping(id, source_version, target_version, created)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (id, source_version) DO UPDATE
+INSERT INTO version_mapping(target_name, id, source_version, target_version, created)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (target_name, id, source_version) DO UPDATE
    SET target_version = excluded.target_version,
        created = excluded.created
 `
 
 type AddVersionMappingParams struct {
+	TargetName    string
 	ID            uuid.UUID
 	SourceVersion int64
 	TargetVersion int64
@@ -29,6 +30,7 @@ type AddVersionMappingParams struct {
 
 func (q *Queries) AddVersionMapping(ctx context.Context, arg AddVersionMappingParams) error {
 	_, err := q.db.Exec(ctx, addVersionMapping,
+		arg.TargetName,
 		arg.ID,
 		arg.SourceVersion,
 		arg.TargetVersion,
@@ -37,13 +39,27 @@ func (q *Queries) AddVersionMapping(ctx context.Context, arg AddVersionMappingPa
 	return err
 }
 
-const getDocumentVersion = `-- name: GetDocumentVersion :one
-SELECT target_version FROM document
-WHERE id = $1
+const deleteTarget = `-- name: DeleteTarget :exec
+DELETE FROM replication_target WHERE name = $1
 `
 
-func (q *Queries) GetDocumentVersion(ctx context.Context, id uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, getDocumentVersion, id)
+func (q *Queries) DeleteTarget(ctx context.Context, name string) error {
+	_, err := q.db.Exec(ctx, deleteTarget, name)
+	return err
+}
+
+const getDocumentVersion = `-- name: GetDocumentVersion :one
+SELECT target_version FROM document
+WHERE target_name = $1 AND id = $2
+`
+
+type GetDocumentVersionParams struct {
+	TargetName string
+	ID         uuid.UUID
+}
+
+func (q *Queries) GetDocumentVersion(ctx context.Context, arg GetDocumentVersionParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getDocumentVersion, arg.TargetName, arg.ID)
 	var target_version int64
 	err := row.Scan(&target_version)
 	return target_version, err
@@ -61,40 +77,115 @@ func (q *Queries) GetState(ctx context.Context, name string) ([]byte, error) {
 	return value, err
 }
 
+const getTarget = `-- name: GetTarget :one
+SELECT name, repository_url, oidc_config, client_id, client_secret,
+       start_from, config, enabled, created, updated
+FROM replication_target
+WHERE name = $1
+`
+
+func (q *Queries) GetTarget(ctx context.Context, name string) (ReplicationTarget, error) {
+	row := q.db.QueryRow(ctx, getTarget, name)
+	var i ReplicationTarget
+	err := row.Scan(
+		&i.Name,
+		&i.RepositoryUrl,
+		&i.OidcConfig,
+		&i.ClientID,
+		&i.ClientSecret,
+		&i.StartFrom,
+		&i.Config,
+		&i.Enabled,
+		&i.Created,
+		&i.Updated,
+	)
+	return i, err
+}
+
 const getTargetVersion = `-- name: GetTargetVersion :one
 SELECT target_version
 FROM version_mapping
-WHERE id = $1 AND source_version = $2
+WHERE target_name = $1 AND id = $2 AND source_version = $3
 `
 
 type GetTargetVersionParams struct {
+	TargetName    string
 	ID            uuid.UUID
 	SourceVersion int64
 }
 
 func (q *Queries) GetTargetVersion(ctx context.Context, arg GetTargetVersionParams) (int64, error) {
-	row := q.db.QueryRow(ctx, getTargetVersion, arg.ID, arg.SourceVersion)
+	row := q.db.QueryRow(ctx, getTargetVersion, arg.TargetName, arg.ID, arg.SourceVersion)
 	var target_version int64
 	err := row.Scan(&target_version)
 	return target_version, err
 }
 
-const removeDocument = `-- name: RemoveDocument :exec
-DELETE FROM document WHERE id = $1
+const listEnabledTargets = `-- name: ListEnabledTargets :many
+SELECT name, repository_url, oidc_config, client_id, client_secret,
+       start_from, config, enabled, created, updated
+FROM replication_target
+WHERE enabled = true
+ORDER BY name
 `
 
-func (q *Queries) RemoveDocument(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, removeDocument, id)
+func (q *Queries) ListEnabledTargets(ctx context.Context) ([]ReplicationTarget, error) {
+	rows, err := q.db.Query(ctx, listEnabledTargets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ReplicationTarget
+	for rows.Next() {
+		var i ReplicationTarget
+		if err := rows.Scan(
+			&i.Name,
+			&i.RepositoryUrl,
+			&i.OidcConfig,
+			&i.ClientID,
+			&i.ClientSecret,
+			&i.StartFrom,
+			&i.Config,
+			&i.Enabled,
+			&i.Created,
+			&i.Updated,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const removeDocument = `-- name: RemoveDocument :exec
+DELETE FROM document WHERE target_name = $1 AND id = $2
+`
+
+type RemoveDocumentParams struct {
+	TargetName string
+	ID         uuid.UUID
+}
+
+func (q *Queries) RemoveDocument(ctx context.Context, arg RemoveDocumentParams) error {
+	_, err := q.db.Exec(ctx, removeDocument, arg.TargetName, arg.ID)
 	return err
 }
 
 const removeDocumentVersionMappings = `-- name: RemoveDocumentVersionMappings :exec
 DELETE FROM version_mapping
-WHERE id = $1
+WHERE target_name = $1 AND id = $2
 `
 
-func (q *Queries) RemoveDocumentVersionMappings(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.Exec(ctx, removeDocumentVersionMappings, id)
+type RemoveDocumentVersionMappingsParams struct {
+	TargetName string
+	ID         uuid.UUID
+}
+
+func (q *Queries) RemoveDocumentVersionMappings(ctx context.Context, arg RemoveDocumentVersionMappingsParams) error {
+	_, err := q.db.Exec(ctx, removeDocumentVersionMappings, arg.TargetName, arg.ID)
 	return err
 }
 
@@ -108,20 +199,48 @@ func (q *Queries) RemoveOldMappings(ctx context.Context, cutoff pgtype.Timestamp
 	return err
 }
 
+const removeTargetData = `-- name: RemoveTargetData :exec
+DELETE FROM document WHERE target_name = $1
+`
+
+func (q *Queries) RemoveTargetData(ctx context.Context, targetName string) error {
+	_, err := q.db.Exec(ctx, removeTargetData, targetName)
+	return err
+}
+
+const removeTargetMappings = `-- name: RemoveTargetMappings :exec
+DELETE FROM version_mapping WHERE target_name = $1
+`
+
+func (q *Queries) RemoveTargetMappings(ctx context.Context, targetName string) error {
+	_, err := q.db.Exec(ctx, removeTargetMappings, targetName)
+	return err
+}
+
+const removeTargetState = `-- name: RemoveTargetState :exec
+DELETE FROM state WHERE name = $1
+`
+
+func (q *Queries) RemoveTargetState(ctx context.Context, name string) error {
+	_, err := q.db.Exec(ctx, removeTargetState, name)
+	return err
+}
+
 const setDocumentVersion = `-- name: SetDocumentVersion :exec
-INSERT INTO document(id, target_version)
-VALUES($1, $2)
-ON CONFLICT (id) DO UPDATE
+INSERT INTO document(target_name, id, target_version)
+VALUES($1, $2, $3)
+ON CONFLICT (target_name, id) DO UPDATE
    SET target_version = excluded.target_version
 `
 
 type SetDocumentVersionParams struct {
+	TargetName    string
 	ID            uuid.UUID
 	TargetVersion int64
 }
 
 func (q *Queries) SetDocumentVersion(ctx context.Context, arg SetDocumentVersionParams) error {
-	_, err := q.db.Exec(ctx, setDocumentVersion, arg.ID, arg.TargetVersion)
+	_, err := q.db.Exec(ctx, setDocumentVersion, arg.TargetName, arg.ID, arg.TargetVersion)
 	return err
 }
 
@@ -139,5 +258,71 @@ type SetStateParams struct {
 
 func (q *Queries) SetState(ctx context.Context, arg SetStateParams) error {
 	_, err := q.db.Exec(ctx, setState, arg.Name, arg.Value)
+	return err
+}
+
+const setTargetEnabled = `-- name: SetTargetEnabled :exec
+UPDATE replication_target
+SET enabled = $1, updated = now()
+WHERE name = $2
+`
+
+type SetTargetEnabledParams struct {
+	Enabled bool
+	Name    string
+}
+
+func (q *Queries) SetTargetEnabled(ctx context.Context, arg SetTargetEnabledParams) error {
+	_, err := q.db.Exec(ctx, setTargetEnabled, arg.Enabled, arg.Name)
+	return err
+}
+
+const targetExists = `-- name: TargetExists :one
+SELECT EXISTS(SELECT 1 FROM replication_target WHERE name = $1)
+`
+
+func (q *Queries) TargetExists(ctx context.Context, name string) (bool, error) {
+	row := q.db.QueryRow(ctx, targetExists, name)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const upsertTarget = `-- name: UpsertTarget :exec
+INSERT INTO replication_target(name, repository_url, oidc_config, client_id, client_secret, start_from, config, enabled)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (name) DO UPDATE
+   SET repository_url = excluded.repository_url,
+       oidc_config = excluded.oidc_config,
+       client_id = excluded.client_id,
+       client_secret = excluded.client_secret,
+       start_from = excluded.start_from,
+       config = excluded.config,
+       enabled = excluded.enabled,
+       updated = now()
+`
+
+type UpsertTargetParams struct {
+	Name          string
+	RepositoryUrl string
+	OidcConfig    string
+	ClientID      string
+	ClientSecret  string
+	StartFrom     int64
+	Config        []byte
+	Enabled       bool
+}
+
+func (q *Queries) UpsertTarget(ctx context.Context, arg UpsertTargetParams) error {
+	_, err := q.db.Exec(ctx, upsertTarget,
+		arg.Name,
+		arg.RepositoryUrl,
+		arg.OidcConfig,
+		arg.ClientID,
+		arg.ClientSecret,
+		arg.StartFrom,
+		arg.Config,
+		arg.Enabled,
+	)
 	return err
 }
