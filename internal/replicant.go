@@ -138,7 +138,7 @@ func Run(ctx context.Context, p Parameters) error {
 	})
 
 	group.Go("pg-subscribe", func(ctx context.Context) error {
-		pg.Subscribe(grace.CancelOnStop(ctx), p.Logger, p.Database, fanOut)
+		pg.Subscribe(grace.CancelOnStop(ctx), p.Logger, p.Database, fanOut) //nolint:staticcheck
 
 		return nil
 	})
