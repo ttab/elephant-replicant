@@ -2,20 +2,15 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"slices"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
-	rpc_newsdoc "github.com/ttab/elephant-api/newsdoc"
 	"github.com/ttab/elephant-api/replicant"
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/postgres"
@@ -25,21 +20,32 @@ import (
 	"github.com/twitchtv/twirp"
 )
 
-type Parameters struct {
-	Server             *elephantine.APIServer
-	Logger             *slog.Logger
-	Database           *pgxpool.Pool
-	Documents          repository.Documents
-	TargetDocuments    repository.Documents
-	MinEventID         int64
-	MetricsRegisterer  prometheus.Registerer
-	AuthInfoParser     elephantine.AuthInfoParser
-	CORSHosts          []string
+// DefaultTargetConfig holds the configuration for the default target built from
+// environment variables.
+type DefaultTargetConfig struct {
+	RepositoryURL      string
+	OIDCConfig         string
+	ClientID           string
+	ClientSecret       string //nolint: gosec
+	StartFrom          int64
 	IgnoreTypes        []string
 	IgnoreSubs         []string
 	IgnoreSections     []string
 	IncludeAttachments []AttachmentRef
 	AllAttachments     bool
+	AcceptErrors       bool
+}
+
+type Parameters struct {
+	Server            *elephantine.APIServer
+	Logger            *slog.Logger
+	Database          *pgxpool.Pool
+	Documents         repository.Documents
+	MetricsRegisterer prometheus.Registerer
+	AuthInfoParser    elephantine.AuthInfoParser
+	CORSHosts         []string
+	DefaultTarget     *DefaultTargetConfig
+	EncryptionKey     []byte
 }
 
 var (
@@ -70,20 +76,17 @@ type LogState struct {
 	Position int64
 }
 
+const (
+	TypeDocumentVersion = "document"
+	TypeNewStatus       = "status"
+	TypeACLUpdate       = "acl"
+	TypeDeleteDocument  = "delete_document"
+	TypeRestoreFinished = "restore_finished"
+	TypeWorkflow        = "workflow"
+)
+
 func Run(ctx context.Context, p Parameters) error {
 	grace := elephantine.NewGracefulShutdown(p.Logger, 10*time.Second)
-
-	var state LogState
-
-	err := LoadState(ctx, postgres.New(p.Database), "log_state", &state)
-	if err != nil {
-		return fmt.Errorf("load log state: %w", err)
-	}
-
-	state.Position = max(state.Position, p.MinEventID)
-
-	p.Logger.Info("starting replication",
-		elephantine.LogKeyEventID, state.Position)
 
 	logMetrics, err := koonkie.NewPrometheusFollowerMetrics(
 		p.MetricsRegisterer, "replicant_follower")
@@ -91,22 +94,27 @@ func Run(ctx context.Context, p Parameters) error {
 		return fmt.Errorf("set up log follower metrics: %w", err)
 	}
 
-	lf := koonkie.NewLogFollower(p.Documents, koonkie.FollowerOptions{
-		Metrics:      logMetrics,
-		StartAfter:   state.Position,
-		CaughtUp:     state.CaughtUp,
-		WaitDuration: 10 * time.Second,
-	})
+	fanOut := pg.NewFanOut[TargetNotification](TargetNotifyChannel)
 
-	cFilter, err := NewContentFilterFromParams(p)
+	err = registerDefaultTarget(ctx, p)
 	if err != nil {
-		return fmt.Errorf("create content filter: %w", err)
+		return fmt.Errorf("register default target: %w", err)
 	}
 
+	manager := NewTargetManager(
+		p.Logger, p.Database, p.Documents, logMetrics, p.EncryptionKey,
+	)
+
+	notifications := make(chan TargetNotification, 16)
+
+	go fanOut.ListenAll(ctx, notifications)
+
 	app := Application{
-		p:       p,
-		lf:      lf,
-		cFilter: cFilter,
+		logger:        p.Logger,
+		db:            p.Database,
+		fanOut:        fanOut,
+		manager:       manager,
+		encryptionKey: p.EncryptionKey,
 	}
 
 	opts, err := elephantine.NewDefaultServiceOptions(
@@ -125,8 +133,14 @@ func Run(ctx context.Context, p Parameters) error {
 
 	group := elephantine.NewErrGroup(ctx, p.Logger)
 
-	group.Go("replicator", func(ctx context.Context) error {
-		return app.Replicate(grace.CancelOnStop(ctx))
+	group.Go("target-manager", func(ctx context.Context) error {
+		return manager.Run(grace.CancelOnStop(ctx), notifications)
+	})
+
+	group.Go("pg-subscribe", func(ctx context.Context) error {
+		pg.Subscribe(grace.CancelOnStop(ctx), p.Logger, p.Database, fanOut) //nolint:staticcheck
+
+		return nil
 	})
 
 	group.Go("server", func(ctx context.Context) error {
@@ -134,18 +148,115 @@ func Run(ctx context.Context, p Parameters) error {
 	})
 
 	group.Go("cleanup", func(ctx context.Context) error {
-		return app.mappingCleanup(grace.CancelOnStop(ctx))
+		return mappingCleanup(grace.CancelOnStop(ctx), p.Database)
 	})
 
 	return group.Wait() //nolint: wrapcheck
 }
 
+func registerDefaultTarget(ctx context.Context, p Parameters) error {
+	if p.DefaultTarget == nil {
+		return nil
+	}
+
+	q := postgres.New(p.Database)
+
+	exists, err := q.TargetExists(ctx, "default")
+	if err != nil {
+		return fmt.Errorf("check if default target exists: %w", err)
+	}
+
+	if exists {
+		return nil
+	}
+
+	dt := p.DefaultTarget
+
+	syncConfig := replicant.SyncConfig{
+		AcceptErrors:   dt.AcceptErrors,
+		AllAttachments: dt.AllAttachments,
+		IgnoreTypes:    dt.IgnoreTypes,
+		IgnoreSubs:     dt.IgnoreSubs,
+	}
+
+	for _, s := range dt.IgnoreSections {
+		docType, sectionUUID, ok := strings.Cut(s, ":")
+		if !ok {
+			return fmt.Errorf("invalid section filter %q", s)
+		}
+
+		syncConfig.IgnoreSections = append(syncConfig.IgnoreSections,
+			&replicant.SectionForType{
+				Type:        docType,
+				SectionUuid: sectionUUID,
+			})
+	}
+
+	for _, a := range dt.IncludeAttachments {
+		syncConfig.IncludeAttachments = append(syncConfig.IncludeAttachments,
+			&replicant.AttachmentForType{
+				Type: a.DocType,
+				Name: a.Name,
+			})
+	}
+
+	configJSON, err := json.Marshal(&syncConfig)
+	if err != nil {
+		return fmt.Errorf("marshal sync config: %w", err)
+	}
+
+	encryptedSecret, err := EncryptSecret(p.EncryptionKey, dt.ClientSecret)
+	if err != nil {
+		return fmt.Errorf("encrypt client secret: %w", err)
+	}
+
+	err = q.UpsertTarget(ctx, postgres.UpsertTargetParams{
+		Name:          "default",
+		RepositoryUrl: dt.RepositoryURL,
+		OidcConfig:    dt.OIDCConfig,
+		ClientID:      dt.ClientID,
+		ClientSecret:  encryptedSecret,
+		StartFrom:     dt.StartFrom,
+		Config:        configJSON,
+		Enabled:       true,
+	})
+	if err != nil {
+		return fmt.Errorf("upsert default target: %w", err)
+	}
+
+	p.Logger.Info("registered default target from environment variables")
+
+	return nil
+}
+
+func mappingCleanup(ctx context.Context, db *pgxpool.Pool) error {
+	for {
+		run := time.After(1 * time.Hour)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err() //nolint: wrapcheck
+		case <-run:
+		}
+
+		q := postgres.New(db)
+
+		err := q.RemoveOldMappings(ctx, pg.Time(
+			time.Now().AddDate(0, -6, 0)))
+		if err != nil {
+			return fmt.Errorf("remove old mappings: %w", err)
+		}
+	}
+}
+
 var _ replicant.Replication = &Application{}
 
 type Application struct {
-	p       Parameters
-	lf      *koonkie.LogFollower
-	cFilter *ContentFilter
+	logger        *slog.Logger
+	db            *pgxpool.Pool
+	fanOut        *pg.FanOut[TargetNotification]
+	manager       *TargetManager
+	encryptionKey []byte
 }
 
 // SendDocument implements replicant.Replication.
@@ -160,553 +271,207 @@ func (a *Application) SendDocument(
 	return nil, twirp.NewError(twirp.Unimplemented, "soon")
 }
 
-const (
-	TypeDocumentVersion = "document"
-	TypeNewStatus       = "status"
-	TypeACLUpdate       = "acl"
-	TypeDeleteDocument  = "delete_document"
-	TypeRestoreFinished = "restore_finished"
-	TypeWorkflow        = "workflow"
-)
-
-func (a *Application) Replicate(ctx context.Context) error {
-	for {
-		var lastSaved int64
-
-		pos, caughtUp := a.lf.GetState()
-
-		items, err := a.lf.GetNext(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to read eventlog: %w", err)
-		}
-
-		for _, item := range items {
-			pos = item.Id
-
-			if item.Event == TypeWorkflow {
-				// Workflows describes effects rather than changes.
-				continue
-			}
-
-			err := a.handleEvent(ctx, item, caughtUp)
-			switch {
-			case errors.Is(err, ErrSkipped):
-				a.p.Logger.Debug("skipped import of document",
-					elephantine.LogKeyEventID, item.Id,
-					elephantine.LogKeyEventType, item.Event,
-					elephantine.LogKeyDocumentUUID, item.Uuid,
-					elephantine.LogKeyError, err,
-				)
-			case errors.Is(err, ErrConflict):
-				a.p.Logger.Info("conflict with change in target repo",
-					elephantine.LogKeyEventID, item.Id,
-					elephantine.LogKeyEventType, item.Event,
-					elephantine.LogKeyDocumentUUID, item.Uuid,
-					elephantine.LogKeyError, err,
-				)
-			case err != nil:
-				return fmt.Errorf("handle event %d (%s): %w",
-					item.Id, item.Uuid, err)
-			default:
-				a.p.Logger.Debug("handled event",
-					elephantine.LogKeyEventID, item.Id,
-					elephantine.LogKeyEventType, item.Event,
-					elephantine.LogKeyDocumentUUID, item.Uuid,
-				)
-
-				lastSaved = pos
-			}
-		}
-
-		if lastSaved != pos {
-			err = StoreState(ctx, postgres.New(a.p.Database), "log_state", LogState{
-				Position: pos,
-				CaughtUp: caughtUp,
-			})
-			if err != nil {
-				return fmt.Errorf("persist log state: %w", err)
-			}
-		}
+// ConfigureTarget implements replicant.Replication.
+func (a *Application) ConfigureTarget(
+	ctx context.Context, req *replicant.ConfigureTargetRequest,
+) (*replicant.ConfigureTargetResponse, error) {
+	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	if err != nil {
+		return nil, err
 	}
+
+	if req.GetName() == "" {
+		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
+	}
+
+	if req.GetRepositoryUrl() == "" {
+		return nil, elephantine.InvalidArgumentf("repository_url", "must not be empty")
+	}
+
+	if req.GetOidcConfig() == "" {
+		return nil, elephantine.InvalidArgumentf("oidc_config", "must not be empty")
+	}
+
+	if req.GetClientId() == "" {
+		return nil, elephantine.InvalidArgumentf("client_id", "must not be empty")
+	}
+
+	if req.GetClientSecret() == "" {
+		return nil, elephantine.InvalidArgumentf("client_secret", "must not be empty")
+	}
+
+	syncConfig := req.GetConfig()
+	if syncConfig == nil {
+		syncConfig = &replicant.SyncConfig{}
+	}
+
+	configJSON, err := json.Marshal(syncConfig)
+	if err != nil {
+		return nil, fmt.Errorf("marshal sync config: %w", err)
+	}
+
+	encryptedSecret, err := EncryptSecret(a.encryptionKey, req.GetClientSecret())
+	if err != nil {
+		return nil, fmt.Errorf("encrypt client secret: %w", err)
+	}
+
+	err = postgres.New(a.db).UpsertTarget(ctx, postgres.UpsertTargetParams{
+		Name:          req.GetName(),
+		RepositoryUrl: req.GetRepositoryUrl(),
+		OidcConfig:    req.GetOidcConfig(),
+		ClientID:      req.GetClientId(),
+		ClientSecret:  encryptedSecret,
+		StartFrom:     req.GetStartFrom(),
+		Config:        configJSON,
+		Enabled:       true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("upsert target: %w", err)
+	}
+
+	err = a.fanOut.Publish(ctx, a.db, TargetNotification{
+		Name:   req.GetName(),
+		Action: TargetActionConfigure,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("publish configure notification: %w", err)
+	}
+
+	return &replicant.ConfigureTargetResponse{}, nil
 }
 
-func (a *Application) handleEvent(
-	ctx context.Context, evt *repository.EventlogItem, caughtUp bool,
-) (outErr error) {
-	docUUID := uuid.MustParse(evt.Uuid)
-
-	if slices.Contains(a.p.IgnoreSubs, evt.UpdaterUri) {
-		return fmt.Errorf("ignored sub: %w", ErrSkipped)
-	}
-
-	if slices.Contains(a.p.IgnoreTypes, evt.Type) {
-		return fmt.Errorf("ignored type: %w", ErrSkipped)
-	}
-
-	// Separate handling of deletes.
-	if evt.Type == TypeDeleteDocument {
-		return a.handleDeleteEvent(ctx, evt, docUUID)
-	}
-
-	var checkRes *repository.GetDocumentResponse
-
-	if a.cFilter.HasFilters(evt.Type) {
-		// Load the current document from the source to perform
-		// content-based filtering. Yes, this might evaluate a document
-		// based on another version of the document than the update
-		// concerns, but we're not aiming for perfection here.
-		res, err := a.p.Documents.Get(ctx,
-			&repository.GetDocumentRequest{
-				Uuid: evt.Uuid,
-			})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
-			// Just ignore deleted documents.
-			return fmt.Errorf("document not found for content filtering: %w", ErrSkipped)
-		} else if err != nil {
-			return fmt.Errorf("get document for content based filtering: %w", err)
-		}
-
-		// Squirrel away the result so that it can be re-used if the
-		// document version actually matches the one in the event.
-		checkRes = res
-
-		doc := rpc_newsdoc.DocumentFromRPC(res.Document)
-
-		if !a.cFilter.Check(doc) {
-			return fmt.Errorf("ignored because of content filter: %w", ErrSkipped)
-		}
-	}
-
-	tx, err := a.p.Database.Begin(ctx)
+// RemoveTarget implements replicant.Replication.
+func (a *Application) RemoveTarget(
+	ctx context.Context, req *replicant.RemoveTargetRequest,
+) (*replicant.RemoveTargetResponse, error) {
+	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return nil, err
 	}
 
-	defer pg.Rollback(tx, &outErr)
-
-	q := postgres.New(tx)
-
-	var isNew bool
-
-	targetVersion, err := q.GetDocumentVersion(ctx, docUUID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		isNew = true
-	} else if err != nil {
-		return fmt.Errorf("get current target version: %w", err)
+	if req.GetName() == "" {
+		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
 	}
 
-	if isNew {
-		err := a.reconcileTypeDifferences(
-			ctx, docUUID.String(), evt.Type)
-		if err != nil {
-			return fmt.Errorf("reconcile type differences for new document: %w", err)
-		}
+	q := postgres.New(a.db)
+
+	err = q.DeleteTarget(ctx, req.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("delete target: %w", err)
 	}
 
-	update := repository.UpdateRequest{
-		Uuid: evt.Uuid,
-		ImportDirective: &repository.ImportDirective{
-			OriginallyCreated: evt.Timestamp,
-			OriginalCreator:   evt.UpdaterUri,
-		},
+	stateKey := req.GetName() + ":log_state"
+
+	err = q.RemoveTargetData(ctx, req.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("remove target data: %w", err)
 	}
 
-	updateType := evt.Event
-
-	if !caughtUp {
-		// If we're not caught up we might just get one event per
-		// document, so we'll need to fill in the blanks here.
-		updateType = TypeDocumentVersion
-
-		metaRes, err := a.p.Documents.GetMeta(ctx,
-			&repository.GetMetaRequest{
-				Uuid: evt.Uuid,
-			})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
-			// Just ignore deleted documents.
-			return fmt.Errorf("document not found for meta read: %w", ErrSkipped)
-		} else if err != nil {
-			return fmt.Errorf("get source meta: %w", err)
-		}
-
-		evt.Version = metaRes.Meta.CurrentVersion
-
-		// Replace import directive with original creation info and set
-		// ACLs on first ingest of the document. Also grab attachments
-		// on first encounter.
-		if isNew {
-			update.Acl = metaRes.Meta.Acl
-
-			update.ImportDirective = &repository.ImportDirective{
-				OriginallyCreated: metaRes.Meta.Created,
-				OriginalCreator:   metaRes.Meta.CreatorUri,
-			}
-
-			for _, info := range metaRes.Meta.Attachments {
-				evt.AttachedObjects = append(evt.AttachedObjects, info.Name)
-			}
-		}
-
-		for status, info := range metaRes.Meta.Heads {
-			// We only set statuses that refer to the version we're
-			// replicating. History will be truncated while we're
-			// catching up.
-			if info.Version != metaRes.Meta.CurrentVersion {
-				continue
-			}
-
-			update.Status = append(update.Status,
-				&repository.StatusUpdate{
-					Name: status,
-					Meta: info.Meta,
-				})
-		}
+	err = q.RemoveTargetMappings(ctx, req.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("remove target mappings: %w", err)
 	}
 
-	switch updateType {
-	case TypeDocumentVersion:
-		// Re-use check result document if possible.
-		if checkRes != nil && checkRes.Version == evt.Version {
-			update.Document = checkRes.Document
-		} else {
-			res, err := a.p.Documents.Get(ctx,
-				&repository.GetDocumentRequest{
-					Uuid:    evt.Uuid,
-					Version: evt.Version,
-				})
-			if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
-				// Just ignore deleted documents.
-				return fmt.Errorf("document not found: %w", ErrSkipped)
-			} else if err != nil {
-				return fmt.Errorf("get source document: %w", err)
-			}
-
-			update.Document = res.Document
-		}
-
-		err = a.prepareAttachments(ctx, evt, &update)
-		if err != nil {
-			return fmt.Errorf("transfer attachments: %w", err)
-		}
-	case TypeNewStatus:
-		mappedVersion, err := q.GetTargetVersion(ctx,
-			postgres.GetTargetVersionParams{
-				ID:            docUUID,
-				SourceVersion: evt.Version,
-			})
-		if errors.Is(err, pgx.ErrNoRows) {
-			// No record of the version that the status refers to, skip.
-			return ErrSkipped
-		}
-
-		statusRes, err := a.p.Documents.GetStatus(ctx, &repository.GetStatusRequest{
-			Uuid: evt.Uuid,
-			Name: evt.Status,
-			Id:   evt.StatusId,
-		})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
-			// Just ignore deleted documents.
-			return fmt.Errorf("document not found: %w", ErrSkipped)
-		} else if err != nil {
-			return fmt.Errorf("get source status: %w", err)
-		}
-
-		update.Status = append(update.Status, &repository.StatusUpdate{
-			Name:    evt.Status,
-			Version: mappedVersion,
-			Meta:    statusRes.Status.Meta,
-		})
-	case TypeACLUpdate:
-		metaRes, err := a.p.Documents.GetMeta(ctx,
-			&repository.GetMetaRequest{
-				Uuid: evt.Uuid,
-			})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
-			// Just ignore deleted documents.
-			return fmt.Errorf("document not found: %w", ErrSkipped)
-		} else if err != nil {
-			return fmt.Errorf("get source meta: %w", err)
-		}
-
-		update.Acl = metaRes.Meta.Acl
-	default:
-		return fmt.Errorf("unhandled event type %q: %w",
-			updateType, ErrSkipped)
+	err = q.RemoveTargetState(ctx, stateKey)
+	if err != nil {
+		return nil, fmt.Errorf("remove target state: %w", err)
 	}
 
-	// We just let new documents overwrite whatever is there.
-	if !isNew {
-		update.IfMatch = targetVersion
-	}
-
-	var upRes *repository.UpdateResponse
-
-	// Retry loop to allow for backfill of document if it doesn't exist in
-	// the destination. F.ex. setting an ACL on a document that hasn't been
-	// created yet will result in a 404.
-	for {
-		res, err := a.p.TargetDocuments.Update(ctx, &update)
-
-		switch {
-		case elephantine.IsTwirpErrorCode(err, twirp.FailedPrecondition):
-			return ErrConflict
-		case elephantine.IsTwirpErrorCode(err, twirp.NotFound) && update.Document == nil:
-			fetchRes, err := a.p.Documents.Get(ctx,
-				&repository.GetDocumentRequest{
-					Uuid: evt.Uuid,
-				})
-			if err != nil {
-				return fmt.Errorf("fetch document for backfill: %w", err)
-			}
-
-			update.Document = fetchRes.Document
-
-			continue
-		case err != nil:
-			return fmt.Errorf("update target: %w", err)
-		}
-
-		upRes = res
-
-		break
-	}
-
-	if updateType == TypeDocumentVersion {
-		err = q.SetDocumentVersion(ctx, postgres.SetDocumentVersionParams{
-			ID:            docUUID,
-			TargetVersion: upRes.Version,
-		})
-		if err != nil {
-			return fmt.Errorf("record new target version: %w", err)
-		}
-
-		err = q.AddVersionMapping(ctx, postgres.AddVersionMappingParams{
-			ID:            docUUID,
-			SourceVersion: evt.Version,
-			TargetVersion: upRes.Version,
-			Created:       pg.Time(time.Now()),
-		})
-		if err != nil {
-			return fmt.Errorf("record new version mapping: %w", err)
-		}
-	}
-
-	err = StoreState(ctx, q, "log_state", LogState{
-		Position: evt.Id,
-		CaughtUp: caughtUp,
+	err = a.fanOut.Publish(ctx, a.db, TargetNotification{
+		Name:   req.GetName(),
+		Action: TargetActionRemove,
 	})
 	if err != nil {
-		return fmt.Errorf("persist log state: %w", err)
+		return nil, fmt.Errorf("publish remove notification: %w", err)
 	}
 
-	err = tx.Commit(ctx)
-	if err != nil {
-		return fmt.Errorf("commit state: %w", err)
-	}
-
-	return nil
+	return &replicant.RemoveTargetResponse{}, nil
 }
 
-func (a *Application) reconcileTypeDifferences(ctx context.Context, docUUID string, sourceType string) error {
-	docRes, err := a.p.TargetDocuments.Get(ctx, &repository.GetDocumentRequest{
-		Uuid: docUUID,
-	})
-	if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("get target document: %w", err)
-	}
-
-	if docRes.Document.Type == sourceType {
-		return nil
-	}
-
-	_, err = a.p.TargetDocuments.Delete(ctx, &repository.DeleteDocumentRequest{
-		Uuid: docUUID,
-	})
+// ChangeTargetState implements replicant.Replication.
+func (a *Application) ChangeTargetState(
+	ctx context.Context, req *replicant.ChangeTargetStateRequest,
+) (*replicant.ChangeTargetStateResponse, error) {
+	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
 	if err != nil {
-		return fmt.Errorf("delete target document: %w", err)
+		return nil, err
 	}
 
-	a.p.Logger.WarnContext(ctx,
-		"deleted document in target to reconcile type differences",
-		elephantine.LogKeyDocumentUUID, docUUID,
-		elephantine.LogKeyDocumentType, sourceType,
-		"old_type", docRes.Document.Type,
+	if req.GetName() == "" {
+		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
+	}
+
+	q := postgres.New(a.db)
+
+	exists, err := q.TargetExists(ctx, req.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("check target exists: %w", err)
+	}
+
+	if !exists {
+		return nil, twirp.NewError(twirp.NotFound, "target not found")
+	}
+
+	var (
+		enabled bool
+		action  string
 	)
 
-	return nil
-}
-
-func (a *Application) prepareAttachments(
-	ctx context.Context,
-	evt *repository.EventlogItem,
-	request *repository.UpdateRequest,
-) error {
-	if len(evt.AttachedObjects) == 0 {
-		return nil
+	switch req.GetAction() {
+	case replicant.TargetAction_TARGET_ACTION_START:
+		enabled = true
+		action = TargetActionStart
+	case replicant.TargetAction_TARGET_ACTION_STOP:
+		enabled = false
+		action = TargetActionStop
+	case replicant.TargetAction_TARGET_ACTION_UNSPECIFIED:
+		return nil, elephantine.InvalidArgumentf("action", "must be start or stop")
 	}
 
-	request.AttachObjects = make(map[string]string)
-
-	for _, name := range evt.AttachedObjects {
-		if !a.shouldReplicateAttachment(name, evt.Type) {
-			continue
-		}
-
-		attachments, err := a.p.Documents.GetAttachments(ctx, &repository.GetAttachmentsRequest{
-			AttachmentName: name,
-			Documents:      []string{evt.Uuid},
-			DownloadLink:   true,
-		})
-		if err != nil {
-			return fmt.Errorf("get download link for %q: %w", name, err)
-		}
-
-		if len(attachments.Attachments) == 0 {
-			// Ignore attachments if they have been deleted.
-			continue
-		}
-
-		obj := attachments.Attachments[0]
-
-		uploadID, err := a.transferAttachment(ctx, obj)
-		if err != nil {
-			return fmt.Errorf("transfer %q: %w", name, err)
-		}
-
-		request.AttachObjects[name] = uploadID
-	}
-
-	return nil
-}
-
-func (a *Application) transferAttachment(
-	ctx context.Context,
-	obj *repository.AttachmentDetails,
-) (_ string, outErr error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, obj.DownloadLink, nil)
-	if err != nil {
-		return "", fmt.Errorf("create download request: %w", err)
-	}
-
-	res, err := http.DefaultClient.Do(req) //nolint: bodyclose
-	if err != nil {
-		return "", fmt.Errorf("make download request: %w", err)
-	}
-
-	defer elephantine.Close("download body", res.Body, &outErr)
-
-	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf(
-			"failed to download attachment, server responded with: %s",
-			res.Status)
-	}
-
-	upload, err := a.p.TargetDocuments.CreateUpload(ctx, &repository.CreateUploadRequest{
-		Name:        obj.Filename,
-		ContentType: obj.ContentType,
-		// TODO: No meta in AttachmentDetails?
+	err = q.SetTargetEnabled(ctx, postgres.SetTargetEnabledParams{
+		Name:    req.GetName(),
+		Enabled: enabled,
 	})
 	if err != nil {
-		return "", fmt.Errorf("create upload: %w", err)
+		return nil, fmt.Errorf("set target enabled: %w", err)
 	}
 
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		upload.Url, res.Body)
-	if err != nil {
-		return "", fmt.Errorf("create upload request: %w", err)
-	}
-
-	upReq.ContentLength = res.ContentLength
-	upReq.Header.Add("Content-Type", obj.ContentType)
-
-	upRes, err := http.DefaultClient.Do(upReq) //nolint: bodyclose
-	if err != nil {
-		return "", fmt.Errorf("make upload request: %w", err)
-	}
-
-	defer elephantine.Close("upload body", upRes.Body, &outErr)
-
-	if upRes.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to upload attachment, server responded with: %s",
-			res.Status)
-	}
-
-	return upload.Id, nil
-}
-
-func (a *Application) shouldReplicateAttachment(name string, docType string) bool {
-	if a.p.AllAttachments {
-		return true
-	}
-
-	for _, r := range a.p.IncludeAttachments {
-		if name == r.Name && docType == r.DocType {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (a *Application) handleDeleteEvent(
-	ctx context.Context, evt *repository.EventlogItem, docUUID uuid.UUID,
-) (outErr error) {
-	tx, err := a.p.Database.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-
-	defer pg.Rollback(tx, &outErr)
-
-	q := postgres.New(tx)
-
-	err = q.RemoveDocument(ctx, docUUID)
-	if err != nil {
-		return fmt.Errorf("remove document target entry: %w", err)
-	}
-
-	err = q.RemoveDocumentVersionMappings(ctx, docUUID)
-	if err != nil {
-		return fmt.Errorf("remove document version mappings: %w", err)
-	}
-
-	_, err = a.p.TargetDocuments.Delete(ctx, &repository.DeleteDocumentRequest{
-		Uuid: evt.Uuid,
-		Meta: map[string]string{
-			"original_delete_record": strconv.FormatInt(evt.DeleteRecordId, 10),
-		},
+	err = a.fanOut.Publish(ctx, a.db, TargetNotification{
+		Name:   req.GetName(),
+		Action: action,
 	})
 	if err != nil {
-		return fmt.Errorf("delete document: %w", err)
+		return nil, fmt.Errorf("publish state change notification: %w", err)
 	}
 
-	err = tx.Commit(ctx)
-	if err != nil {
-		return fmt.Errorf("commit state: %w", err)
-	}
-
-	return nil
+	return &replicant.ChangeTargetStateResponse{}, nil
 }
 
-func (a *Application) mappingCleanup(ctx context.Context) error {
-	for {
-		run := time.After(1 * time.Hour)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err() //nolint: wrapcheck
-		case <-run:
-		}
-
-		q := postgres.New(a.p.Database)
-
-		// Remove mappings older than six months.
-		err := q.RemoveOldMappings(ctx, pg.Time(
-			time.Now().AddDate(0, -6, 0)))
-		if err != nil {
-			return fmt.Errorf("remove old mappings: %w", err)
-		}
+// GetTargetState implements replicant.Replication.
+func (a *Application) GetTargetState(
+	ctx context.Context, req *replicant.GetTargetStateRequest,
+) (*replicant.GetTargetStateResponse, error) {
+	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	if err != nil {
+		return nil, err
 	}
+
+	if req.GetName() == "" {
+		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
+	}
+
+	exists, err := postgres.New(a.db).TargetExists(ctx, req.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("check target exists: %w", err)
+	}
+
+	if !exists {
+		return nil, twirp.NewError(twirp.NotFound, "target not found")
+	}
+
+	state := a.manager.GetWorkerState(req.GetName())
+
+	return &replicant.GetTargetStateResponse{
+		State: state,
+	}, nil
 }

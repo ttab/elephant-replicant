@@ -10,6 +10,24 @@ ACL:s will always be replicated.
 
 Attachments will only be replicated if `-all-attachments` is set or if they have been explicitly enabled by document type and attachment name using `-include-attachments`.
 
+## Encryption key
+
+Client secrets are encrypted at rest using AES-256-GCM. The service requires a 64-character hex-encoded encryption key provided via the `ENCRYPTION_KEY` environment variable (or `--encryption-key` flag).
+
+Use the provided script to generate and store a key in Vault:
+
+``` shell
+./scripts/set-encryption-key ele000-stage
+```
+
+This generates a random key and stores it at `ele000-stage/services/replicant/encryption-key`. The script will not overwrite an existing key.
+
+To read it back for use in configuration:
+
+``` shell
+vault kv get -mount=ele000-stage -field=value services/replicant/encryption-key
+```
+
 ## Example configuration
 
 Configuration for running replication to a local repository instance:
@@ -39,4 +57,6 @@ TARGET_REPOSITORY_ENDPOINT=http://localhost:1080
 TARGET_OIDC_CONFIG=https://login.stage.tt.se/realms/elephant/.well-known/openid-configuration
 TARGET_CLIENT_ID=replicant-receive
 TARGET_CLIENT_SECRET=xoxo
+
+ENCRYPTION_KEY=<64-character hex key from Vault>
 ```

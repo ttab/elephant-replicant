@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <vault-mount>" >&2
+    exit 1
+fi
+
+mount="$1"
+path="services/replicant/encryption-key"
+
+existing=$(vault kv get -mount="$mount" -format=json "$path" 2>/dev/null || true)
+
+if [ -n "$existing" ]; then
+    echo "Encryption key already exists at ${mount}/${path}, not overwriting." >&2
+    exit 0
+fi
+
+key=$(openssl rand -hex 32)
+
+vault kv put -mount="$mount" "$path" value="$key"
+
+echo "Encryption key set at ${mount}/${path}."
