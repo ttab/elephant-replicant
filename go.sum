@@ -109,8 +109,8 @@ github.com/ttab/elephantine v0.25.0 h1:0Z9tvlqzVD2rUSwwihOK/iqtjoPO0Xh0JzTCWUSRz
 github.com/ttab/elephantine v0.25.0/go.mod h1:T4ZtP2Clg236YZehCituqPCDFZ2PuBn/BoX5gYkCtvE=
 github.com/ttab/koonkie v0.1.3 h1:1sy/K8DfHQHuGQ9XXI+mTblAUWch5qxcn7VQnFPSUGM=
 github.com/ttab/koonkie v0.1.3/go.mod h1:Cnc+LHVtmY1J2dKzINkjPttjUyFQ5xJRHB40MSHP45A=
-github.com/ttab/mage v0.9.0 h1:zNd1aM0kvuYAPy59BqSW+5rGkEzMLp3PMYE2HL+AhAI=
-github.com/ttab/mage v0.9.0/go.mod h1:nemmtRhMVzb/DRo+stFa6BaQwLatMFmmZ9d8XmGgd6U=
+github.com/ttab/mage v0.9.1 h1:0X1AR5G/nevuLYtJW5BgN03glBicJZxb5z7jIUHN5ro=
+github.com/ttab/mage v0.9.1/go.mod h1:nemmtRhMVzb/DRo+stFa6BaQwLatMFmmZ9d8XmGgd6U=
 github.com/ttab/newsdoc v1.0.0 h1:ftGbUkReu+teOGuh00eZgeSraghzyMaMEJQ0acrFYDw=
 github.com/ttab/newsdoc v1.0.0/go.mod h1:Lt4bBWEsP3b5ChLwzuQ4fvxcfnv2u5DwrV9ADmE5ViQ=
 github.com/twitchtv/twirp v8.1.3+incompatible h1:+F4TdErPgSUbMZMwp13Q/KgDVuI7HJXP61mNV3/7iuU=

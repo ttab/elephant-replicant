@@ -10,7 +10,7 @@ require (
 	github.com/ttab/elephant-api v0.21.4-0.20260302160728-83df1a560b69
 	github.com/ttab/elephantine v0.25.0
 	github.com/ttab/koonkie v0.1.3
-	github.com/ttab/mage v0.9.0
+	github.com/ttab/mage v0.9.1
 	github.com/ttab/newsdoc v1.0.0
 	github.com/twitchtv/twirp v8.1.3+incompatible
 	github.com/urfave/cli/v3 v3.7.0
