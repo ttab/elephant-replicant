@@ -124,6 +124,10 @@ func (w *Worker) handleEvent(
 		return fmt.Errorf("ignored type: %w", ErrSkipped)
 	}
 
+	if evt.Type == TypeNewStatus && isSchedulerUsable(evt.Status, evt.UpdaterUri) {
+		return fmt.Errorf("scheduler-created usable status: %w", ErrSkipped)
+	}
+
 	if evt.Type == TypeDeleteDocument {
 		return w.handleDeleteEvent(ctx, evt, docUUID)
 	}
@@ -219,6 +223,10 @@ func (w *Worker) handleEvent(
 
 		for status, info := range metaRes.Meta.Heads {
 			if info.Version != metaRes.Meta.CurrentVersion {
+				continue
+			}
+
+			if isSchedulerUsable(status, info.Creator) {
 				continue
 			}
 
@@ -509,6 +517,10 @@ func (w *Worker) shouldReplicateAttachment(name string, docType string) bool {
 	}
 
 	return false
+}
+
+func isSchedulerUsable(status, creator string) bool {
+	return status == "usable" && creator == "internal://scheduler"
 }
 
 func (w *Worker) handleDeleteEvent(
