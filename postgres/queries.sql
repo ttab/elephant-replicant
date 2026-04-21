@@ -67,6 +67,11 @@ FROM replication_target
 WHERE enabled = true
 ORDER BY name;
 
+-- name: ListTargets :many
+SELECT name, repository_url
+FROM replication_target
+ORDER BY name;
+
 -- name: DeleteTarget :exec
 DELETE FROM replication_target WHERE name = @name;
 

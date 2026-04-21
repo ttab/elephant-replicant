@@ -447,6 +447,34 @@ func (a *Application) ChangeTargetState(
 	return &replicant.ChangeTargetStateResponse{}, nil
 }
 
+// ListTargets implements replicant.Replication.
+func (a *Application) ListTargets(
+	ctx context.Context, _ *replicant.ListTargetsRequest,
+) (*replicant.ListTargetsResponse, error) {
+	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := postgres.New(a.db).ListTargets(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list targets: %w", err)
+	}
+
+	targets := make([]*replicant.TargetInfo, 0, len(rows))
+
+	for _, r := range rows {
+		targets = append(targets, &replicant.TargetInfo{
+			Name:          r.Name,
+			RepositoryUrl: r.RepositoryUrl,
+		})
+	}
+
+	return &replicant.ListTargetsResponse{
+		Targets: targets,
+	}, nil
+}
+
 // GetTargetState implements replicant.Replication.
 func (a *Application) GetTargetState(
 	ctx context.Context, req *replicant.GetTargetStateRequest,

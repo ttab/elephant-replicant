@@ -15,6 +15,13 @@ type Document struct {
 	TargetName    string
 }
 
+type JobLock struct {
+	Name      string
+	Holder    string
+	Touched   pgtype.Timestamptz
+	Iteration int64
+}
+
 type ReplicationTarget struct {
 	Name          string
 	RepositoryUrl string
