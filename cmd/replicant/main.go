@@ -19,6 +19,8 @@ import (
 	"golang.org/x/oauth2"
 )
 
+var version string // set via -ldflags at build time
+
 func main() {
 	err := godotenv.Load()
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -226,7 +228,8 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 	)
 
 	server := elephantine.NewAPIServer(logger, addr, profileAddr,
-		elephantine.APIServerCORSHosts(corsHosts...))
+		elephantine.APIServerCORSHosts(corsHosts...),
+		elephantine.APIServerVersion(version))
 
 	var defaultTarget *internal.DefaultTargetConfig
 
