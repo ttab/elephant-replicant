@@ -127,6 +127,7 @@ func (tm *TargetManager) startWorker(ctx context.Context, name string) {
 	tm.workers[name] = tw
 
 	go func() {
+		defer cancel()
 		defer close(done)
 
 		tm.runWorker(workerCtx, name)

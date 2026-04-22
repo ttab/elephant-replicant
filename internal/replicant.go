@@ -26,7 +26,7 @@ type DefaultTargetConfig struct {
 	RepositoryURL      string
 	OIDCConfig         string
 	ClientID           string
-	ClientSecret       string //nolint: gosec
+	ClientSecret       string
 	StartFrom          int64
 	IgnoreTypes        []string
 	IgnoreSubs         []string
