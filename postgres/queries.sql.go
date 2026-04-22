@@ -161,7 +161,7 @@ func (q *Queries) ListEnabledTargets(ctx context.Context) ([]ReplicationTarget, 
 }
 
 const listTargets = `-- name: ListTargets :many
-SELECT name, repository_url
+SELECT name, repository_url, enabled
 FROM replication_target
 ORDER BY name
 `
@@ -169,6 +169,7 @@ ORDER BY name
 type ListTargetsRow struct {
 	Name          string
 	RepositoryUrl string
+	Enabled       bool
 }
 
 func (q *Queries) ListTargets(ctx context.Context) ([]ListTargetsRow, error) {
@@ -180,7 +181,7 @@ func (q *Queries) ListTargets(ctx context.Context) ([]ListTargetsRow, error) {
 	var items []ListTargetsRow
 	for rows.Next() {
 		var i ListTargetsRow
-		if err := rows.Scan(&i.Name, &i.RepositoryUrl); err != nil {
+		if err := rows.Scan(&i.Name, &i.RepositoryUrl, &i.Enabled); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

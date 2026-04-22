@@ -68,7 +68,7 @@ WHERE enabled = true
 ORDER BY name;
 
 -- name: ListTargets :many
-SELECT name, repository_url
+SELECT name, repository_url, enabled
 FROM replication_target
 ORDER BY name;
 

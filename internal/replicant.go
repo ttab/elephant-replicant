@@ -467,6 +467,7 @@ func (a *Application) ListTargets(
 		targets = append(targets, &replicant.TargetInfo{
 			Name:          r.Name,
 			RepositoryUrl: r.RepositoryUrl,
+			Enabled:       r.Enabled,
 		})
 	}
 
