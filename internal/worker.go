@@ -460,7 +460,7 @@ func (w *Worker) transferAttachment(
 		return "", fmt.Errorf("create download request: %w", err)
 	}
 
-	res, err := http.DefaultClient.Do(req) //nolint: bodyclose,gosec
+	res, err := http.DefaultClient.Do(req) //nolint: bodyclose
 	if err != nil {
 		return "", fmt.Errorf("make download request: %w", err)
 	}
@@ -490,7 +490,7 @@ func (w *Worker) transferAttachment(
 	upReq.ContentLength = res.ContentLength
 	upReq.Header.Add("Content-Type", obj.ContentType)
 
-	upRes, err := http.DefaultClient.Do(upReq) //nolint: bodyclose,gosec
+	upRes, err := http.DefaultClient.Do(upReq) //nolint: bodyclose
 	if err != nil {
 		return "", fmt.Errorf("make upload request: %w", err)
 	}

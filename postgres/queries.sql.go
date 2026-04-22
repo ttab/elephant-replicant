@@ -160,6 +160,38 @@ func (q *Queries) ListEnabledTargets(ctx context.Context) ([]ReplicationTarget, 
 	return items, nil
 }
 
+const listTargets = `-- name: ListTargets :many
+SELECT name, repository_url, enabled
+FROM replication_target
+ORDER BY name
+`
+
+type ListTargetsRow struct {
+	Name          string
+	RepositoryUrl string
+	Enabled       bool
+}
+
+func (q *Queries) ListTargets(ctx context.Context) ([]ListTargetsRow, error) {
+	rows, err := q.db.Query(ctx, listTargets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTargetsRow
+	for rows.Next() {
+		var i ListTargetsRow
+		if err := rows.Scan(&i.Name, &i.RepositoryUrl, &i.Enabled); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const removeDocument = `-- name: RemoveDocument :exec
 DELETE FROM document WHERE target_name = $1 AND id = $2
 `
