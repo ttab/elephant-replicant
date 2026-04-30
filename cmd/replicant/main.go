@@ -45,6 +45,19 @@ func main() {
 				Value:   ":1081",
 			},
 			&cli.StringFlag{
+				Name:    "tls-addr",
+				Value:   ":1443",
+				Sources: cli.EnvVars("TLS_ADDR", "TLS_LISTEN_ADDR"),
+			},
+			&cli.StringFlag{
+				Name:    "cert-file",
+				Sources: cli.EnvVars("TLS_CERT_PATH"),
+			},
+			&cli.StringFlag{
+				Name:    "key-file",
+				Sources: cli.EnvVars("TLS_KEY_PATH"),
+			},
+			&cli.StringFlag{
 				Name:    "log-level",
 				Sources: cli.EnvVars("LOG_LEVEL"),
 				Value:   "info",
@@ -146,6 +159,9 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 	var (
 		addr               = c.String("addr")
 		profileAddr        = c.String("profile-addr")
+		tlsAddr            = c.String("tls-addr")
+		certFile           = c.String("cert-file")
+		keyFile            = c.String("key-file")
 		logLevel           = c.String("log-level")
 		repositoryEndpoint = c.String("repository-endpoint")
 		targetEndpoint     = c.String("target-repository-endpoint")
@@ -227,9 +243,17 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 		repositoryEndpoint, elephantClient,
 	)
 
-	server := elephantine.NewAPIServer(logger, addr, profileAddr,
+	serverOpts := []elephantine.APIServerOption{
 		elephantine.APIServerCORSHosts(corsHosts...),
-		elephantine.APIServerVersion(version))
+		elephantine.APIServerVersion(version),
+	}
+
+	if certFile != "" {
+		serverOpts = append(serverOpts,
+			elephantine.APIServerTLS(tlsAddr, certFile, keyFile))
+	}
+
+	server := elephantine.NewAPIServer(logger, addr, profileAddr, serverOpts...)
 
 	var defaultTarget *internal.DefaultTargetConfig
 
