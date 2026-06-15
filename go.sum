@@ -66,8 +66,8 @@ github.com/klauspost/compress v1.18.0 h1:c/Cqfb0r+Yi+JtIEq73FWXVkRonBlf0CRNYc8Zt
 github.com/klauspost/compress v1.18.0/go.mod h1:2Pp+KzxcywXVXMr50+X0Q/Lsb43OQHYWRCY2AiWywWQ=
 github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
-github.com/magefile/mage v1.15.0 h1:BvGheCMAsG3bWUDbZ8AyXXpCNwU9u5CB6sM+HNb9HYg=
-github.com/magefile/mage v1.15.0/go.mod h1:z5UZb/iS3GoOSn0JgWuiw7dxlurVYTu+/jHXqQg881A=
+github.com/magefile/mage v1.17.2 h1:fyXVu1eadI8Ap1HCCNgEhJ5McIWiYhLR8uol64ZZc40=
+github.com/magefile/mage v1.17.2/go.mod h1:Yj51kqllmsgFpvvSzgrZPK9WtluG3kUhFaBUVLo4feA=
 github.com/mattn/go-colorable v0.1.14 h1:9A9LHSqF/7dyVVX6g0U9cwm9pG3kP9gSzcuIPHPsaIE=
 github.com/mattn/go-colorable v0.1.14/go.mod h1:6LmQG8QLFO4G5z1gPvYEzlUgJ2wF+stgPZH1UqBm1s8=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
@@ -97,8 +97,8 @@ github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UV
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/ttab/elephant-api v0.22.2 h1:XiIG5A61uzW4UvWdbv1VLdE12JH/fUc/VAfs4qpxYDc=
-github.com/ttab/elephant-api v0.22.2/go.mod h1:sESOTidzKwGk4xjidEM1Wt6bjoelKpOoOLeJ336rnJs=
+github.com/ttab/elephant-api v0.24.0 h1:qy1pYOJ9+GkSKF4V3o30AbbhiI6WdsnDdGmf/UOenlQ=
+github.com/ttab/elephant-api v0.24.0/go.mod h1:4yLd0PwZRjsRj0Lb7QSQPaoYvz0zYZ7fALe1ANaYOhg=
 github.com/ttab/elephantine v0.26.1 h1:S3NvFET8vo42bNp7qLXS5DPZ82oFPBjbQhuc2247F4A=
 github.com/ttab/elephantine v0.26.1/go.mod h1:YUoQI2qAbGEju/StMzKNM+c2VvPYsSG782JnjT3mRMI=
 github.com/ttab/koonkie v0.1.3 h1:1sy/K8DfHQHuGQ9XXI+mTblAUWch5qxcn7VQnFPSUGM=
