@@ -257,6 +257,14 @@ func (w *Worker) handleEvent(
 			update.Document = res.Document
 		}
 
+		// ACL updates that accompany a document version are folded
+		// onto the document event. In catch-up mode we ignore the
+		// historical event ACL; for new documents the current ACL has
+		// been read from document meta instead.
+		if caughtUp && len(evt.Acl) > 0 {
+			update.Acl = evt.Acl
+		}
+
 		err = w.prepareAttachments(ctx, evt, &update)
 		if err != nil {
 			return fmt.Errorf("transfer attachments: %w", err)
