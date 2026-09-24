@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"runtime/debug"
 
@@ -15,11 +16,33 @@ import (
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/internal"
 	"github.com/ttab/elephantine"
+	"github.com/ttab/elephantine/pg"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/oauth2"
 )
 
 var version string // set via -ldflags at build time
+
+// DefaultDBMaxConns is the size of the query pool, set here rather than left
+// to pgx: its default is max(4, NumCPU()) read from the node's cpuset rather
+// than the cgroup quota, so an unset pool tracks whichever node the pod lands
+// on and changes size invisibly on reschedule.
+//
+// The replicant's concurrency is its targets, not request traffic. Each enabled
+// target runs one worker that handles events one at a time and holds at most
+// one transaction, which stays open across the calls to the target repository,
+// and one job lock whose ping runs every ten seconds with a five second timeout.
+// A ping that cannot get a connection in time loses the lock and restarts the
+// worker, so each target needs two connections: three targets is six. The
+// admin RPCs, the hourly mapping cleanup and, without a bouncer, the LISTEN
+// connection that the subscriber hijacks out of the pool take the last two.
+// Raise it with DB_MAX_CONNS when running more than three targets.
+const DefaultDBMaxConns = 8
+
+// listenPoolMaxConns is the size of the direct pool when queries go through a
+// bouncer: it then carries only the LISTEN session, which the subscriber
+// hijacks out of the pool, plus one spare.
+const listenPoolMaxConns = 2
 
 func main() {
 	err := godotenv.Load()
@@ -72,6 +95,23 @@ func main() {
 				Name:    "db",
 				Value:   "postgres://elephant-replicant:pass@localhost/elephant-replicant",
 				Sources: cli.EnvVars("CONN_STRING"),
+			},
+			&cli.StringFlag{
+				Name:    "db-bouncer",
+				Sources: cli.EnvVars("BOUNCER_CONN_STRING"),
+				Usage: `Connection string for a transaction pooler such as
+PgBouncer. When set, all queries go through it and the direct connection only
+carries the LISTEN session.`,
+			},
+			&cli.IntFlag{
+				Name:    "db-max-conns",
+				Sources: cli.EnvVars("DB_MAX_CONNS"),
+				Value:   DefaultDBMaxConns,
+				Usage: `Maximum size of the Postgres connection pool used for
+queries. Overrides pool_max_conns in the connection string. Zero or less leaves
+the pool to size itself, which means max(4, NumCPU()) read from the node's
+cpuset. With a bouncer configured the direct pool is fixed at 2 and this applies
+to the bouncer pool.`,
 			},
 			&cli.StringSliceFlag{
 				Name:    "cors-hosts",
@@ -208,19 +248,59 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 
 	logger.Info("connecting to database")
 
-	dbpool, err := pgxpool.New(ctx, c.String("db"))
+	var (
+		connString        = c.String("db")
+		bouncerConnString = c.String("db-bouncer")
+		dbMaxConns        = c.Int("db-max-conns")
+		useBouncer        = bouncerConnString != "" && bouncerConnString != connString
+	)
+
+	pubsubMaxConns := dbMaxConns
+	if useBouncer {
+		pubsubMaxConns = listenPoolMaxConns
+	}
+
+	pubsubPool, err := newPool(ctx, connString, pubsubMaxConns)
 	if err != nil {
-		return fmt.Errorf("create connection pool: %w", err)
+		return fmt.Errorf("direct database: %w", err)
 	}
 
 	defer func() {
 		// Don't block for close.
-		go dbpool.Close()
+		go pubsubPool.Close()
 	}()
 
-	err = dbpool.Ping(ctx)
-	if err != nil {
-		return fmt.Errorf("connect to database: %w", err)
+	dbpool := pubsubPool
+
+	if useBouncer {
+		dbpool, err = newPool(ctx, bouncerConnString, dbMaxConns)
+		if err != nil {
+			return fmt.Errorf("bouncer database: %w", err)
+		}
+
+		defer func() {
+			go dbpool.Close()
+		}()
+	}
+
+	logger.Info("created connection pools",
+		"max_conns", dbMaxConns,
+		"direct_max_conns", pubsubMaxConns,
+		"bouncer", useBouncer)
+
+	// The pubsub pool doubles as the main pool when no bouncer is
+	// configured, and is then only registered once.
+	poolCollectors := map[string]*pgxpool.Pool{"main": dbpool}
+	if dbpool != pubsubPool {
+		poolCollectors["pubsub"] = pubsubPool
+	}
+
+	for name, pool := range poolCollectors {
+		err = prometheus.DefaultRegisterer.Register(
+			pg.NewPoolStatCollector(pool, name))
+		if err != nil {
+			return fmt.Errorf("register %s pool metrics: %w", name, err)
+		}
 	}
 
 	logger.Info("setting up source authentication")
@@ -283,6 +363,7 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 		Server:            server,
 		Logger:            logger,
 		Database:          dbpool,
+		ListenDatabase:    pubsubPool,
 		Documents:         documents,
 		CORSHosts:         corsHosts,
 		MetricsRegisterer: prometheus.DefaultRegisterer,
@@ -295,4 +376,38 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 	}
 
 	return nil
+}
+
+// newPool creates a connection pool and verifies that the database answers.
+// A positive maxConns sizes the pool; zero or less leaves that to the
+// connection string or pgx.
+func newPool(
+	ctx context.Context, connString string, maxConns int,
+) (*pgxpool.Pool, error) {
+	conf, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("parse connection string: %w", err)
+	}
+
+	if maxConns > math.MaxInt32 {
+		return nil, fmt.Errorf("max conns %d exceeds %d", maxConns, math.MaxInt32)
+	}
+
+	if maxConns > 0 {
+		conf.MaxConns = int32(maxConns)
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, conf)
+	if err != nil {
+		return nil, fmt.Errorf("create connection pool: %w", err)
+	}
+
+	err = pool.Ping(ctx)
+	if err != nil {
+		pool.Close()
+
+		return nil, fmt.Errorf("connect to database: %w", err)
+	}
+
+	return pool, nil
 }

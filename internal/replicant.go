@@ -46,6 +46,11 @@ type Parameters struct {
 	CORSHosts         []string
 	DefaultTarget     *DefaultTargetConfig
 	EncryptionKey     []byte
+
+	// ListenDatabase is a direct connection pool used for LISTEN, which
+	// doesn't survive transaction pooling. It is the same pool as Database
+	// when no bouncer is configured.
+	ListenDatabase *pgxpool.Pool
 }
 
 var (
@@ -138,7 +143,9 @@ func Run(ctx context.Context, p Parameters) error {
 	})
 
 	group.Go("pg-subscribe", func(ctx context.Context) error {
-		pg.Subscribe(grace.CancelOnStop(ctx), p.Logger, p.Database, fanOut) //nolint:staticcheck
+		// LISTEN on the direct pool: session-level LISTEN is
+		// incompatible with transaction pooling.
+		pg.Subscribe(grace.CancelOnStop(ctx), p.Logger, p.ListenDatabase, fanOut) //nolint:staticcheck
 
 		return nil
 	})
