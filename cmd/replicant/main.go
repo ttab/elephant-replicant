@@ -9,17 +9,33 @@ import (
 	"os"
 	"runtime/debug"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/internal"
 	"github.com/ttab/elephantine"
+	"github.com/ttab/elephantine/pg"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/oauth2"
 )
 
 var version string // set via -ldflags at build time
+
+// DefaultDBMaxConns is the size of the query pool, set here rather than left
+// to pgx: its default is max(4, NumCPU()) read from the node's cpuset rather
+// than the cgroup quota, so an unset pool tracks whichever node the pod lands
+// on and changes size invisibly on reschedule.
+//
+// The replicant's concurrency is its targets, not request traffic. Each enabled
+// target runs one worker that handles events one at a time and holds at most
+// one transaction, which stays open across the calls to the target repository,
+// and one job lock whose ping runs every ten seconds with a five second timeout.
+// A ping that cannot get a connection in time loses the lock and restarts the
+// worker, so each target needs two connections: three targets is six. The
+// admin RPCs, the hourly mapping cleanup and, without a bouncer, the LISTEN
+// connection that the subscriber hijacks out of the pool take the last two.
+// Raise it with DB_MAX_CONNS when running more than three targets.
+const DefaultDBMaxConns = 8
 
 func main() {
 	err := godotenv.Load()
@@ -72,6 +88,23 @@ func main() {
 				Name:    "db",
 				Value:   "postgres://elephant-replicant:pass@localhost/elephant-replicant",
 				Sources: cli.EnvVars("CONN_STRING"),
+			},
+			&cli.StringFlag{
+				Name:    "db-bouncer",
+				Sources: cli.EnvVars("BOUNCER_CONN_STRING"),
+				Usage: `Connection string for a transaction pooler such as
+PgBouncer. When set, all queries go through it and the direct connection only
+carries the LISTEN session.`,
+			},
+			&cli.IntFlag{
+				Name:    "db-max-conns",
+				Sources: cli.EnvVars("DB_MAX_CONNS"),
+				Value:   DefaultDBMaxConns,
+				Usage: `Maximum size of the Postgres connection pool used for
+queries. Overrides pool_max_conns in the connection string. Zero or less leaves
+the pool to size itself, which means max(4, NumCPU()) read from the node's
+cpuset. With a bouncer configured the direct pool is fixed at 2 and this applies
+to the bouncer pool.`,
 			},
 			&cli.StringSliceFlag{
 				Name:    "cors-hosts",
@@ -208,20 +241,33 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 
 	logger.Info("connecting to database")
 
-	dbpool, err := pgxpool.New(ctx, c.String("db"))
+	var (
+		connString        = c.String("db")
+		bouncerConnString = c.String("db-bouncer")
+		dbMaxConns        = c.Int("db-max-conns")
+	)
+
+	// WithPubSub is the split the replicant_target subscriber needs:
+	// session level LISTEN doesn't survive transaction pooling, so behind a
+	// bouncer it gets a direct pool of its own, and without one it shares
+	// the main pool.
+	pools, err := pg.NewPools(ctx,
+		prometheus.DefaultRegisterer, connString, dbMaxConns,
+		pg.WithBouncer(bouncerConnString),
+		pg.WithPubSub(),
+	)
 	if err != nil {
-		return fmt.Errorf("create connection pool: %w", err)
+		return fmt.Errorf("create database pools: %w", err)
 	}
 
 	defer func() {
 		// Don't block for close.
-		go dbpool.Close()
+		go pools.Close()
 	}()
 
-	err = dbpool.Ping(ctx)
-	if err != nil {
-		return fmt.Errorf("connect to database: %w", err)
-	}
+	logger.Info("created connection pools",
+		"max_conns", dbMaxConns,
+		"separate_pubsub_pool", pools.PubSub != pools.Main)
 
 	logger.Info("setting up source authentication")
 
@@ -282,7 +328,8 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 	err = internal.Run(ctx, internal.Parameters{
 		Server:            server,
 		Logger:            logger,
-		Database:          dbpool,
+		Database:          pools.Main,
+		ListenDatabase:    pools.PubSub,
 		Documents:         documents,
 		CORSHosts:         corsHosts,
 		MetricsRegisterer: prometheus.DefaultRegisterer,
