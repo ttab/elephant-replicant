@@ -6,11 +6,9 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"runtime/debug"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ttab/elephant-api/repository"
@@ -38,11 +36,6 @@ var version string // set via -ldflags at build time
 // connection that the subscriber hijacks out of the pool take the last two.
 // Raise it with DB_MAX_CONNS when running more than three targets.
 const DefaultDBMaxConns = 8
-
-// listenPoolMaxConns is the size of the direct pool when queries go through a
-// bouncer: it then carries only the LISTEN session, which the subscriber
-// hijacks out of the pool, plus one spare.
-const listenPoolMaxConns = 2
 
 func main() {
 	err := godotenv.Load()
@@ -252,56 +245,29 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 		connString        = c.String("db")
 		bouncerConnString = c.String("db-bouncer")
 		dbMaxConns        = c.Int("db-max-conns")
-		useBouncer        = bouncerConnString != "" && bouncerConnString != connString
 	)
 
-	pubsubMaxConns := dbMaxConns
-	if useBouncer {
-		pubsubMaxConns = listenPoolMaxConns
-	}
-
-	pubsubPool, err := newPool(ctx, connString, pubsubMaxConns)
+	// WithPubSub is the split the replicant_target subscriber needs:
+	// session level LISTEN doesn't survive transaction pooling, so behind a
+	// bouncer it gets a direct pool of its own, and without one it shares
+	// the main pool.
+	pools, err := pg.NewPools(ctx,
+		prometheus.DefaultRegisterer, connString, dbMaxConns,
+		pg.WithBouncer(bouncerConnString),
+		pg.WithPubSub(),
+	)
 	if err != nil {
-		return fmt.Errorf("direct database: %w", err)
+		return fmt.Errorf("create database pools: %w", err)
 	}
 
 	defer func() {
 		// Don't block for close.
-		go pubsubPool.Close()
+		go pools.Close()
 	}()
-
-	dbpool := pubsubPool
-
-	if useBouncer {
-		dbpool, err = newPool(ctx, bouncerConnString, dbMaxConns)
-		if err != nil {
-			return fmt.Errorf("bouncer database: %w", err)
-		}
-
-		defer func() {
-			go dbpool.Close()
-		}()
-	}
 
 	logger.Info("created connection pools",
 		"max_conns", dbMaxConns,
-		"direct_max_conns", pubsubMaxConns,
-		"bouncer", useBouncer)
-
-	// The pubsub pool doubles as the main pool when no bouncer is
-	// configured, and is then only registered once.
-	poolCollectors := map[string]*pgxpool.Pool{"main": dbpool}
-	if dbpool != pubsubPool {
-		poolCollectors["pubsub"] = pubsubPool
-	}
-
-	for name, pool := range poolCollectors {
-		err = prometheus.DefaultRegisterer.Register(
-			pg.NewPoolStatCollector(pool, name))
-		if err != nil {
-			return fmt.Errorf("register %s pool metrics: %w", name, err)
-		}
-	}
+		"separate_pubsub_pool", pools.PubSub != pools.Main)
 
 	logger.Info("setting up source authentication")
 
@@ -362,8 +328,8 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 	err = internal.Run(ctx, internal.Parameters{
 		Server:            server,
 		Logger:            logger,
-		Database:          dbpool,
-		ListenDatabase:    pubsubPool,
+		Database:          pools.Main,
+		ListenDatabase:    pools.PubSub,
 		Documents:         documents,
 		CORSHosts:         corsHosts,
 		MetricsRegisterer: prometheus.DefaultRegisterer,
@@ -376,38 +342,4 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 	}
 
 	return nil
-}
-
-// newPool creates a connection pool and verifies that the database answers.
-// A positive maxConns sizes the pool; zero or less leaves that to the
-// connection string or pgx.
-func newPool(
-	ctx context.Context, connString string, maxConns int,
-) (*pgxpool.Pool, error) {
-	conf, err := pgxpool.ParseConfig(connString)
-	if err != nil {
-		return nil, fmt.Errorf("parse connection string: %w", err)
-	}
-
-	if maxConns > math.MaxInt32 {
-		return nil, fmt.Errorf("max conns %d exceeds %d", maxConns, math.MaxInt32)
-	}
-
-	if maxConns > 0 {
-		conf.MaxConns = int32(maxConns)
-	}
-
-	pool, err := pgxpool.NewWithConfig(ctx, conf)
-	if err != nil {
-		return nil, fmt.Errorf("create connection pool: %w", err)
-	}
-
-	err = pool.Ping(ctx)
-	if err != nil {
-		pool.Close()
-
-		return nil, fmt.Errorf("connect to database: %w", err)
-	}
-
-	return pool, nil
 }

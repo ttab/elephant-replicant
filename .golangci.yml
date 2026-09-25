@@ -60,6 +60,14 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
+    rules:
+      # elephantine deprecated its Twirp error and scope helpers in favour of
+      # the connect.Error returning ones in elephantine/rpc. The replicant is
+      # still a Twirp service, so the Twirp shaped errors are the ones its
+      # handlers have to return; these go with the Twirp mount, not before it.
+      - linters:
+          - staticcheck
+        text: "SA1019: github.com/ttab/elephantine.(RequireAnyScope|InvalidArgumentf|IsTwirpErrorCode) is deprecated"
     paths:
       - third_party$
       - builtin$
