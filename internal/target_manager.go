@@ -14,10 +14,23 @@ import (
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/postgres"
 	"github.com/ttab/elephantine"
-	"github.com/ttab/elephantine/pg"
+	"github.com/ttab/elephantine/pg/joblock"
 	"github.com/ttab/koonkie"
 	"golang.org/x/oauth2"
 )
+
+// workerGiveUpAfter is how long a target's worker may spend failing before the
+// job lock gives up on it instead of restarting it again. The failure modes
+// that reach it are all external to the target itself — the target repository
+// unreachable, its credentials rejected, our own database down — so the budget
+// has to be long enough to sit out an incident at the other end: an hour is
+// twelve of the five minute default HealthyRuntime, and a target that has been
+// failing continuously for that long is something a human has to look at.
+//
+// Giving up stops replication for that target until the process restarts or
+// the target is reconfigured, which is why this is an hour and not the handful
+// of minutes the migration guide uses as its example.
+const workerGiveUpAfter = time.Hour
 
 type targetWorker struct {
 	cancel context.CancelFunc
@@ -131,16 +144,24 @@ func (tm *TargetManager) startWorker(ctx context.Context, name string) {
 		defer close(done)
 
 		tm.runWorker(workerCtx, name)
+
+		// The job lock can give up, and then the worker is gone while
+		// its entry is still in the map, making a later start
+		// notification a no-op. Drop the entry so the target can be
+		// started again.
+		tm.forgetWorker(name, tw)
 	}()
 }
 
 func (tm *TargetManager) runWorker(ctx context.Context, name string) {
 	logger := tm.logger.With("target", name)
 
-	err := pg.RunInJobLock(
+	err := joblock.Run(
 		ctx, tm.db, logger,
 		"replicant:"+name, "replicant:"+name,
-		pg.JobLockOptions{},
+		joblock.Options{
+			GiveUpAfter: workerGiveUpAfter,
+		},
 		func(ctx context.Context) error {
 			return tm.workerFunc(ctx, logger, name)
 		},
@@ -240,6 +261,18 @@ func (tm *TargetManager) workerFunc(
 	}
 
 	return w.Replicate(ctx)
+}
+
+// forgetWorker removes a worker's entry, but only if it is still the entry for
+// the running worker: stopWorker may already have removed it, and a
+// reconfigure may have replaced it with a new one.
+func (tm *TargetManager) forgetWorker(name string, tw *targetWorker) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if tm.workers[name] == tw {
+		delete(tm.workers, name)
+	}
 }
 
 func (tm *TargetManager) stopWorker(name string) {
