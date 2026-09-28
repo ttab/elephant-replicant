@@ -266,7 +266,8 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 	}()
 
 	logger.Info("created connection pools",
-		"max_conns", dbMaxConns,
+		"max_conns", pools.Main.Config().MaxConns,
+		"pubsub_max_conns", pools.PubSub.Config().MaxConns,
 		"separate_pubsub_pool", pools.PubSub != pools.Main)
 
 	logger.Info("setting up source authentication")
