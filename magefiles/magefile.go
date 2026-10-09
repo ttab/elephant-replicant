@@ -7,7 +7,8 @@ import (
 	"context"
 
 	"github.com/ttab/elephant-replicant/schema"
-
+	//mage:import docs
+	_ "github.com/ttab/mage/docs"
 	//mage:import sql
 	sql "github.com/ttab/mage/sql"
 )
