@@ -67,9 +67,8 @@ var (
 // resetting the connection or the direct pool being unreachable; those are
 // worth retrying rather than taking the process down, since the workers do
 // not depend on notifications to replicate. Nothing here waits on a
-// notification either, so unlike elephant-user there is no reason to pin the
-// backoff flat: a direct pool that stays unreachable logs a restart once a
-// minute rather than every five seconds.
+// notification either, so there is no reason to pin the backoff short: a
+// direct pool that stays unreachable logs a restart once a minute.
 var subscriberRetryOptions = elephantine.RetryOptions{}
 
 type AttachmentRef struct {
