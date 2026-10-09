@@ -12,10 +12,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ttab/elephant-api/replicant"
+	"github.com/ttab/elephant-api/replicant/replicantconnect"
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/postgres"
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg"
+	"github.com/ttab/elephantine/rpc"
 	"github.com/ttab/koonkie"
 	"github.com/twitchtv/twirp"
 )
@@ -57,6 +59,17 @@ var (
 	ErrSkipped  = errors.New("skipped event")
 	ErrConflict = errors.New("document has been updated in target")
 )
+
+// subscriberRetryOptions restarts the LISTEN subscriber for as long as it
+// keeps failing, on the library's default curve: one second growing to a
+// minute, never giving up. The subscriber reconnects by itself on a ping
+// timeout and returns only on other connection errors, such as a failover
+// resetting the connection or the direct pool being unreachable; those are
+// worth retrying rather than taking the process down, since the workers do
+// not depend on notifications to replicate. Nothing here waits on a
+// notification either, so there is no reason to pin the backoff short: a
+// direct pool that stays unreachable logs a restart once a minute.
+var subscriberRetryOptions = elephantine.RetryOptions{}
 
 type AttachmentRef struct {
 	DocType string
@@ -114,27 +127,19 @@ func Run(ctx context.Context, p Parameters) error {
 
 	go fanOut.ListenAll(ctx, notifications)
 
-	app := Application{
-		logger:        p.Logger,
-		db:            p.Database,
-		fanOut:        fanOut,
-		manager:       manager,
-		encryptionKey: p.EncryptionKey,
-	}
+	app := NewApplication(
+		p.Logger, p.Database, fanOut, manager, p.EncryptionKey)
 
+	// One value configures both mounts: the Twirp hooks, the Connect
+	// interceptors and the authentication middleware in front of them.
 	opts, err := elephantine.NewDefaultServiceOptions(
-		p.Logger, p.AuthInfoParser, prometheus.DefaultRegisterer,
+		p.Logger, p.AuthInfoParser, p.MetricsRegisterer,
 		elephantine.ServiceAuthRequired)
 	if err != nil {
 		return fmt.Errorf("set up service config: %w", err)
 	}
 
-	service := replicant.NewReplicationServer(&app,
-		twirp.WithServerJSONSkipDefaults(true),
-		twirp.WithServerHooks(opts.Hooks),
-	)
-
-	p.Server.RegisterAPI(service, opts)
+	app.RegisterAPI(p.Server, opts)
 
 	group := elephantine.NewErrGroup(ctx, p.Logger)
 
@@ -142,13 +147,20 @@ func Run(ctx context.Context, p Parameters) error {
 		return manager.Run(grace.CancelOnStop(ctx), notifications)
 	})
 
-	group.Go("pg-subscribe", func(ctx context.Context) error {
-		// LISTEN on the direct pool: session-level LISTEN is
-		// incompatible with transaction pooling.
-		pg.Subscribe(grace.CancelOnStop(ctx), p.Logger, p.ListenDatabase, fanOut) //nolint:staticcheck
+	// LISTEN on the direct pool: session-level LISTEN is incompatible with
+	// transaction pooling. The pings that prove the connection alive go
+	// through the same pool, as in the rest of the fleet, so that the
+	// health of the direct connection is never judged through the
+	// bouncer. A notification published while the connection was dead is
+	// lost, so every connect and reconnect reconciles the workers with the
+	// table.
+	subscriber := pg.NewSubscriber(p.Logger, p.ListenDatabase,
+		[]pg.ChannelSubscription{fanOut},
+		pg.WithOnReconnect(manager.Reconcile),
+	)
 
-		return nil
-	})
+	group.GoWithRetries("pg-subscribe", subscriberRetryOptions,
+		stopScoped(grace, subscriber.Run))
 
 	group.Go("server", func(ctx context.Context) error {
 		return p.Server.ListenAndServe(grace.CancelOnQuit(ctx))
@@ -159,6 +171,25 @@ func Run(ctx context.Context, p Parameters) error {
 	})
 
 	return group.Wait() //nolint: wrapcheck
+}
+
+// stopScoped runs fn with a context that is cancelled when a graceful stop is
+// requested, and treats a return caused by that stop as a clean exit rather
+// than a task failure.
+func stopScoped(
+	grace *elephantine.GracefulShutdown,
+	fn func(ctx context.Context) error,
+) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		stopCtx := grace.CancelOnStop(ctx)
+
+		err := fn(stopCtx)
+		if err != nil && stopCtx.Err() == nil {
+			return err
+		}
+
+		return nil
+	}
 }
 
 func registerDefaultTarget(ctx context.Context, p Parameters) error {
@@ -242,7 +273,7 @@ func mappingCleanup(ctx context.Context, db *pgxpool.Pool) error {
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err() //nolint: wrapcheck
+			return ctx.Err()
 		case <-run:
 		}
 
@@ -258,12 +289,52 @@ func mappingCleanup(ctx context.Context, db *pgxpool.Pool) error {
 
 var _ replicant.Replication = &Application{}
 
+// Application implements the Replication service.
 type Application struct {
 	logger        *slog.Logger
 	db            *pgxpool.Pool
 	fanOut        *pg.FanOut[TargetNotification]
 	manager       *TargetManager
 	encryptionKey []byte
+}
+
+// NewApplication creates the Replication service implementation.
+func NewApplication(
+	logger *slog.Logger,
+	db *pgxpool.Pool,
+	fanOut *pg.FanOut[TargetNotification],
+	manager *TargetManager,
+	encryptionKey []byte,
+) *Application {
+	return &Application{
+		logger:        logger,
+		db:            db,
+		fanOut:        fanOut,
+		manager:       manager,
+		encryptionKey: encryptionKey,
+	}
+}
+
+// RegisterAPI mounts the Replication service on both stacks: Twirp on
+// "/twirp/elephant.replicant.Replication/" and Connect on
+// "/elephant.replicant.Replication/", behind the same authentication
+// middleware and with the same hooks, interceptors and scope checks.
+func (a *Application) RegisterAPI(
+	server *elephantine.APIServer, opts elephantine.ServiceOptions,
+) {
+	server.RegisterAPI(
+		replicant.NewReplicationServer(a, opts.ServerOptions()), opts)
+
+	// The handlers still return Twirp errors, so the Connect mount
+	// translates them on the way out. The interceptor is innermost, so
+	// that logging and metrics observe the translated code. It goes away
+	// with the move to the rpc error vocabulary.
+	opts.Interceptors = append(opts.Interceptors, rpc.LegacyTwirpErrors())
+
+	path, handler := replicantconnect.NewReplicationServiceHandler(
+		a, opts.HandlerOptions()...)
+
+	server.RegisterConnect(path, handler, opts)
 }
 
 // SendDocument implements replicant.Replication.

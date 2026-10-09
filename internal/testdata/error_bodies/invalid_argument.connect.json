@@ -1,0 +1,18 @@
+{
+  "status": 400,
+  "body": {
+    "code": "invalid_argument",
+    "details": [
+      {
+        "debug": {
+          "meta": {
+            "argument": "name"
+          }
+        },
+        "type": "elephantine.rpc.ErrorMeta",
+        "value": "ChAKCGFyZ3VtZW50EgRuYW1l"
+      }
+    ],
+    "message": "name must not be empty"
+  }
+}
