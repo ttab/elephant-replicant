@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sync"
 	"time"
 
@@ -93,7 +94,7 @@ func (tm *TargetManager) Run(
 		case <-ctx.Done():
 			tm.stopAll()
 
-			return ctx.Err() //nolint: wrapcheck
+			return ctx.Err()
 		case n := <-notifications:
 			tm.handleNotification(ctx, n)
 		}
@@ -295,11 +296,7 @@ func (tm *TargetManager) stopWorker(name string) {
 
 func (tm *TargetManager) stopAll() {
 	tm.mu.Lock()
-	workers := make(map[string]*targetWorker, len(tm.workers))
-
-	for k, v := range tm.workers {
-		workers[k] = v
-	}
+	workers := maps.Clone(tm.workers)
 
 	tm.workers = make(map[string]*targetWorker)
 

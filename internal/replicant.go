@@ -12,10 +12,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ttab/elephant-api/replicant"
+	"github.com/ttab/elephant-api/replicant/replicantconnect"
 	"github.com/ttab/elephant-api/repository"
 	"github.com/ttab/elephant-replicant/postgres"
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg"
+	"github.com/ttab/elephantine/rpc"
 	"github.com/ttab/koonkie"
 	"github.com/twitchtv/twirp"
 )
@@ -114,27 +116,19 @@ func Run(ctx context.Context, p Parameters) error {
 
 	go fanOut.ListenAll(ctx, notifications)
 
-	app := Application{
-		logger:        p.Logger,
-		db:            p.Database,
-		fanOut:        fanOut,
-		manager:       manager,
-		encryptionKey: p.EncryptionKey,
-	}
+	app := NewApplication(
+		p.Logger, p.Database, fanOut, manager, p.EncryptionKey)
 
+	// One value configures both mounts: the Twirp hooks, the Connect
+	// interceptors and the authentication middleware in front of them.
 	opts, err := elephantine.NewDefaultServiceOptions(
-		p.Logger, p.AuthInfoParser, prometheus.DefaultRegisterer,
+		p.Logger, p.AuthInfoParser, p.MetricsRegisterer,
 		elephantine.ServiceAuthRequired)
 	if err != nil {
 		return fmt.Errorf("set up service config: %w", err)
 	}
 
-	service := replicant.NewReplicationServer(&app,
-		twirp.WithServerJSONSkipDefaults(true),
-		twirp.WithServerHooks(opts.Hooks),
-	)
-
-	p.Server.RegisterAPI(service, opts)
+	app.RegisterAPI(p.Server, opts)
 
 	group := elephantine.NewErrGroup(ctx, p.Logger)
 
@@ -242,7 +236,7 @@ func mappingCleanup(ctx context.Context, db *pgxpool.Pool) error {
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err() //nolint: wrapcheck
+			return ctx.Err()
 		case <-run:
 		}
 
@@ -258,12 +252,52 @@ func mappingCleanup(ctx context.Context, db *pgxpool.Pool) error {
 
 var _ replicant.Replication = &Application{}
 
+// Application implements the Replication service.
 type Application struct {
 	logger        *slog.Logger
 	db            *pgxpool.Pool
 	fanOut        *pg.FanOut[TargetNotification]
 	manager       *TargetManager
 	encryptionKey []byte
+}
+
+// NewApplication creates the Replication service implementation.
+func NewApplication(
+	logger *slog.Logger,
+	db *pgxpool.Pool,
+	fanOut *pg.FanOut[TargetNotification],
+	manager *TargetManager,
+	encryptionKey []byte,
+) *Application {
+	return &Application{
+		logger:        logger,
+		db:            db,
+		fanOut:        fanOut,
+		manager:       manager,
+		encryptionKey: encryptionKey,
+	}
+}
+
+// RegisterAPI mounts the Replication service on both stacks: Twirp on
+// "/twirp/elephant.replicant.Replication/" and Connect on
+// "/elephant.replicant.Replication/", behind the same authentication
+// middleware and with the same hooks, interceptors and scope checks.
+func (a *Application) RegisterAPI(
+	server *elephantine.APIServer, opts elephantine.ServiceOptions,
+) {
+	server.RegisterAPI(
+		replicant.NewReplicationServer(a, opts.ServerOptions()), opts)
+
+	// The handlers still return Twirp errors, so the Connect mount
+	// translates them on the way out. The interceptor is innermost, so
+	// that logging and metrics observe the translated code. It goes away
+	// with the move to the rpc error vocabulary.
+	opts.Interceptors = append(opts.Interceptors, rpc.LegacyTwirpErrors())
+
+	path, handler := replicantconnect.NewReplicationServiceHandler(
+		a, opts.HandlerOptions()...)
+
+	server.RegisterConnect(path, handler, opts)
 }
 
 // SendDocument implements replicant.Replication.

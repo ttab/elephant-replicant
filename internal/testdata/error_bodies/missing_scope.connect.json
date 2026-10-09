@@ -1,0 +1,18 @@
+{
+  "status": 403,
+  "body": {
+    "code": "permission_denied",
+    "details": [
+      {
+        "debug": {
+          "meta": {
+            "required_any_of_scopes": "doc_admin"
+          }
+        },
+        "type": "elephantine.rpc.ErrorMeta",
+        "value": "CiMKFnJlcXVpcmVkX2FueV9vZl9zY29wZXMSCWRvY19hZG1pbg"
+      }
+    ],
+    "message": "missing required scope"
+  }
+}
