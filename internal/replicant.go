@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ttab/elephant-api/replicant"
@@ -19,7 +20,6 @@ import (
 	"github.com/ttab/elephantine/pg"
 	"github.com/ttab/elephantine/rpc"
 	"github.com/ttab/koonkie"
-	"github.com/twitchtv/twirp"
 )
 
 // DefaultTargetConfig holds the configuration for the default target built from
@@ -322,14 +322,11 @@ func NewApplication(
 func (a *Application) RegisterAPI(
 	server *elephantine.APIServer, opts elephantine.ServiceOptions,
 ) {
+	// The handlers return rpc errors, so there is no translation left to
+	// do on the Connect side; the Twirp mount translates in the other
+	// direction through the interceptor opts.ServerOptions() installs.
 	server.RegisterAPI(
 		replicant.NewReplicationServer(a, opts.ServerOptions()), opts)
-
-	// The handlers still return Twirp errors, so the Connect mount
-	// translates them on the way out. The interceptor is innermost, so
-	// that logging and metrics observe the translated code. It goes away
-	// with the move to the rpc error vocabulary.
-	opts.Interceptors = append(opts.Interceptors, rpc.LegacyTwirpErrors())
 
 	path, handler := replicantconnect.NewReplicationServiceHandler(
 		a, opts.HandlerOptions()...)
@@ -341,41 +338,41 @@ func (a *Application) RegisterAPI(
 func (a *Application) SendDocument(
 	ctx context.Context, _ *replicant.SendDocumentRequest,
 ) (*replicant.SendDocumentResponse, error) {
-	_, err := elephantine.RequireAnyScope(ctx, "doc_admin", "doc_write")
+	_, err := rpc.RequireAnyScope(ctx, "doc_admin", "doc_write")
 	if err != nil {
 		return nil, err
 	}
 
-	return nil, twirp.NewError(twirp.Unimplemented, "soon")
+	return nil, rpc.Errorf(connect.CodeUnimplemented, "soon")
 }
 
 // ConfigureTarget implements replicant.Replication.
 func (a *Application) ConfigureTarget(
 	ctx context.Context, req *replicant.ConfigureTargetRequest,
 ) (*replicant.ConfigureTargetResponse, error) {
-	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	_, err := rpc.RequireAnyScope(ctx, "doc_admin")
 	if err != nil {
 		return nil, err
 	}
 
 	if req.GetName() == "" {
-		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
+		return nil, rpc.InvalidArgumentf("name", "must not be empty")
 	}
 
 	if req.GetRepositoryUrl() == "" {
-		return nil, elephantine.InvalidArgumentf("repository_url", "must not be empty")
+		return nil, rpc.InvalidArgumentf("repository_url", "must not be empty")
 	}
 
 	if req.GetOidcConfig() == "" {
-		return nil, elephantine.InvalidArgumentf("oidc_config", "must not be empty")
+		return nil, rpc.InvalidArgumentf("oidc_config", "must not be empty")
 	}
 
 	if req.GetClientId() == "" {
-		return nil, elephantine.InvalidArgumentf("client_id", "must not be empty")
+		return nil, rpc.InvalidArgumentf("client_id", "must not be empty")
 	}
 
 	if req.GetClientSecret() == "" {
-		return nil, elephantine.InvalidArgumentf("client_secret", "must not be empty")
+		return nil, rpc.InvalidArgumentf("client_secret", "must not be empty")
 	}
 
 	syncConfig := req.GetConfig()
@@ -385,12 +382,12 @@ func (a *Application) ConfigureTarget(
 
 	configJSON, err := json.Marshal(syncConfig)
 	if err != nil {
-		return nil, fmt.Errorf("marshal sync config: %w", err)
+		return nil, rpc.Internalf("marshal sync config: %w", err)
 	}
 
 	encryptedSecret, err := EncryptSecret(a.encryptionKey, req.GetClientSecret())
 	if err != nil {
-		return nil, fmt.Errorf("encrypt client secret: %w", err)
+		return nil, rpc.Internalf("encrypt client secret: %w", err)
 	}
 
 	err = postgres.New(a.db).UpsertTarget(ctx, postgres.UpsertTargetParams{
@@ -404,7 +401,7 @@ func (a *Application) ConfigureTarget(
 		Enabled:       true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("upsert target: %w", err)
+		return nil, rpc.Internalf("upsert target: %w", err)
 	}
 
 	err = a.fanOut.Publish(ctx, a.db, TargetNotification{
@@ -412,7 +409,7 @@ func (a *Application) ConfigureTarget(
 		Action: TargetActionConfigure,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("publish configure notification: %w", err)
+		return nil, rpc.Internalf("publish configure notification: %w", err)
 	}
 
 	return &replicant.ConfigureTargetResponse{}, nil
@@ -422,37 +419,37 @@ func (a *Application) ConfigureTarget(
 func (a *Application) RemoveTarget(
 	ctx context.Context, req *replicant.RemoveTargetRequest,
 ) (*replicant.RemoveTargetResponse, error) {
-	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	_, err := rpc.RequireAnyScope(ctx, "doc_admin")
 	if err != nil {
 		return nil, err
 	}
 
 	if req.GetName() == "" {
-		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
+		return nil, rpc.InvalidArgumentf("name", "must not be empty")
 	}
 
 	q := postgres.New(a.db)
 
 	err = q.DeleteTarget(ctx, req.GetName())
 	if err != nil {
-		return nil, fmt.Errorf("delete target: %w", err)
+		return nil, rpc.Internalf("delete target: %w", err)
 	}
 
 	stateKey := req.GetName() + ":log_state"
 
 	err = q.RemoveTargetData(ctx, req.GetName())
 	if err != nil {
-		return nil, fmt.Errorf("remove target data: %w", err)
+		return nil, rpc.Internalf("remove target data: %w", err)
 	}
 
 	err = q.RemoveTargetMappings(ctx, req.GetName())
 	if err != nil {
-		return nil, fmt.Errorf("remove target mappings: %w", err)
+		return nil, rpc.Internalf("remove target mappings: %w", err)
 	}
 
 	err = q.RemoveTargetState(ctx, stateKey)
 	if err != nil {
-		return nil, fmt.Errorf("remove target state: %w", err)
+		return nil, rpc.Internalf("remove target state: %w", err)
 	}
 
 	err = a.fanOut.Publish(ctx, a.db, TargetNotification{
@@ -460,7 +457,7 @@ func (a *Application) RemoveTarget(
 		Action: TargetActionRemove,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("publish remove notification: %w", err)
+		return nil, rpc.Internalf("publish remove notification: %w", err)
 	}
 
 	return &replicant.RemoveTargetResponse{}, nil
@@ -470,24 +467,24 @@ func (a *Application) RemoveTarget(
 func (a *Application) ChangeTargetState(
 	ctx context.Context, req *replicant.ChangeTargetStateRequest,
 ) (*replicant.ChangeTargetStateResponse, error) {
-	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	_, err := rpc.RequireAnyScope(ctx, "doc_admin")
 	if err != nil {
 		return nil, err
 	}
 
 	if req.GetName() == "" {
-		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
+		return nil, rpc.InvalidArgumentf("name", "must not be empty")
 	}
 
 	q := postgres.New(a.db)
 
 	exists, err := q.TargetExists(ctx, req.GetName())
 	if err != nil {
-		return nil, fmt.Errorf("check target exists: %w", err)
+		return nil, rpc.Internalf("check target exists: %w", err)
 	}
 
 	if !exists {
-		return nil, twirp.NewError(twirp.NotFound, "target not found")
+		return nil, rpc.NotFound("target not found")
 	}
 
 	var (
@@ -503,7 +500,7 @@ func (a *Application) ChangeTargetState(
 		enabled = false
 		action = TargetActionStop
 	case replicant.TargetAction_TARGET_ACTION_UNSPECIFIED:
-		return nil, elephantine.InvalidArgumentf("action", "must be start or stop")
+		return nil, rpc.InvalidArgumentf("action", "must be start or stop")
 	}
 
 	err = q.SetTargetEnabled(ctx, postgres.SetTargetEnabledParams{
@@ -511,7 +508,7 @@ func (a *Application) ChangeTargetState(
 		Enabled: enabled,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("set target enabled: %w", err)
+		return nil, rpc.Internalf("set target enabled: %w", err)
 	}
 
 	err = a.fanOut.Publish(ctx, a.db, TargetNotification{
@@ -519,7 +516,7 @@ func (a *Application) ChangeTargetState(
 		Action: action,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("publish state change notification: %w", err)
+		return nil, rpc.Internalf("publish state change notification: %w", err)
 	}
 
 	return &replicant.ChangeTargetStateResponse{}, nil
@@ -529,14 +526,14 @@ func (a *Application) ChangeTargetState(
 func (a *Application) ListTargets(
 	ctx context.Context, _ *replicant.ListTargetsRequest,
 ) (*replicant.ListTargetsResponse, error) {
-	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	_, err := rpc.RequireAnyScope(ctx, "doc_admin")
 	if err != nil {
 		return nil, err
 	}
 
 	rows, err := postgres.New(a.db).ListTargets(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list targets: %w", err)
+		return nil, rpc.Internalf("list targets: %w", err)
 	}
 
 	targets := make([]*replicant.TargetInfo, 0, len(rows))
@@ -558,22 +555,22 @@ func (a *Application) ListTargets(
 func (a *Application) GetTargetState(
 	ctx context.Context, req *replicant.GetTargetStateRequest,
 ) (*replicant.GetTargetStateResponse, error) {
-	_, err := elephantine.RequireAnyScope(ctx, "doc_admin")
+	_, err := rpc.RequireAnyScope(ctx, "doc_admin")
 	if err != nil {
 		return nil, err
 	}
 
 	if req.GetName() == "" {
-		return nil, elephantine.InvalidArgumentf("name", "must not be empty")
+		return nil, rpc.InvalidArgumentf("name", "must not be empty")
 	}
 
 	exists, err := postgres.New(a.db).TargetExists(ctx, req.GetName())
 	if err != nil {
-		return nil, fmt.Errorf("check target exists: %w", err)
+		return nil, rpc.Internalf("check target exists: %w", err)
 	}
 
 	if !exists {
-		return nil, twirp.NewError(twirp.NotFound, "target not found")
+		return nil, rpc.NotFound("target not found")
 	}
 
 	state := a.manager.GetWorkerState(req.GetName())

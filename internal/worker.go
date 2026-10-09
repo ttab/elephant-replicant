@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,8 +19,8 @@ import (
 	"github.com/ttab/elephant-replicant/postgres"
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg"
+	"github.com/ttab/elephantine/rpc"
 	"github.com/ttab/koonkie"
-	"github.com/twitchtv/twirp"
 )
 
 // Worker handles replication for a single target.
@@ -139,7 +140,7 @@ func (w *Worker) handleEvent(
 			&repository.GetDocumentRequest{
 				Uuid: evt.Uuid,
 			})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+		if rpc.IsCode(err, connect.CodeNotFound) {
 			return fmt.Errorf("document not found for content filtering: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get document for content based filtering: %w", err)
@@ -200,7 +201,7 @@ func (w *Worker) handleEvent(
 			&repository.GetMetaRequest{
 				Uuid: evt.Uuid,
 			})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+		if rpc.IsCode(err, connect.CodeNotFound) {
 			return fmt.Errorf("document not found for meta read: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get source meta: %w", err)
@@ -248,7 +249,7 @@ func (w *Worker) handleEvent(
 					Uuid:    evt.Uuid,
 					Version: evt.Version,
 				})
-			if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+			if rpc.IsCode(err, connect.CodeNotFound) {
 				return fmt.Errorf("document not found: %w", ErrSkipped)
 			} else if err != nil {
 				return fmt.Errorf("get source document: %w", err)
@@ -285,7 +286,7 @@ func (w *Worker) handleEvent(
 			Name: evt.Status,
 			Id:   evt.StatusId,
 		})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+		if rpc.IsCode(err, connect.CodeNotFound) {
 			return fmt.Errorf("document not found: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get source status: %w", err)
@@ -301,7 +302,7 @@ func (w *Worker) handleEvent(
 			&repository.GetMetaRequest{
 				Uuid: evt.Uuid,
 			})
-		if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+		if rpc.IsCode(err, connect.CodeNotFound) {
 			return fmt.Errorf("document not found: %w", ErrSkipped)
 		} else if err != nil {
 			return fmt.Errorf("get source meta: %w", err)
@@ -323,9 +324,9 @@ func (w *Worker) handleEvent(
 		res, err := w.target.Update(ctx, &update)
 
 		switch {
-		case elephantine.IsTwirpErrorCode(err, twirp.FailedPrecondition):
+		case rpc.IsCode(err, connect.CodeFailedPrecondition):
 			return ErrConflict
-		case elephantine.IsTwirpErrorCode(err, twirp.NotFound) && update.Document == nil:
+		case rpc.IsCode(err, connect.CodeNotFound) && update.Document == nil:
 			fetchRes, err := w.source.Get(ctx,
 				&repository.GetDocumentRequest{
 					Uuid: evt.Uuid,
@@ -390,7 +391,7 @@ func (w *Worker) reconcileTypeDifferences(
 	docRes, err := w.target.Get(ctx, &repository.GetDocumentRequest{
 		Uuid: docUUID,
 	})
-	if elephantine.IsTwirpErrorCode(err, twirp.NotFound) {
+	if rpc.IsCode(err, connect.CodeNotFound) {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("get target document: %w", err)
