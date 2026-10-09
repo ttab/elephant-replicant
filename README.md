@@ -47,7 +47,13 @@ The two differ in three ways a caller that moves has to know about:
 
 `internal/testdata/error_bodies/` holds the raw error body each mount answers
 for the same failure; `TestErrorParity` is what keeps the two mounts agreeing
-on code, message and metadata.
+on code, message and metadata. The handlers construct their errors with the
+`elephantine/rpc` helpers, and the Twirp mount translates them back on the
+way out.
+
+The replicant is itself a Connect client: it calls the source repository and
+every target repository on their Connect paths, so each of them has to run
+elephant-repository v1.9.0 or later.
 
 ## Encryption key
 

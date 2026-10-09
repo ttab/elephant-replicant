@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/ttab/elephant-api/replicant"
 	"github.com/ttab/elephant-api/repository"
+	"github.com/ttab/elephant-api/repository/repositoryconnect"
 	"github.com/ttab/elephant-replicant/postgres"
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg/joblock"
@@ -280,8 +281,8 @@ func (tm *TargetManager) workerFunc(
 
 	targetClient := oauth2.NewClient(ctx, auth.TokenSource)
 
-	targetDocs := repository.NewDocumentsProtobufClient(
-		target.RepositoryUrl, targetClient,
+	targetDocs := repositoryconnect.NewDocumentsServiceClient(
+		targetClient, target.RepositoryUrl,
 	)
 
 	cFilter, err := NewContentFilterFromSyncConfig(&syncConfig)

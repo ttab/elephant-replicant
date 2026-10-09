@@ -14,7 +14,6 @@ require (
 	github.com/ttab/koonkie v0.2.0
 	github.com/ttab/mage v0.15.0
 	github.com/ttab/newsdoc v1.1.0
-	github.com/twitchtv/twirp v8.1.3+incompatible
 	github.com/urfave/cli/v3 v3.14.0
 	golang.org/x/oauth2 v0.37.0
 )
@@ -51,6 +50,7 @@ require (
 	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/ryanuber/go-glob v1.0.0 // indirect
+	github.com/twitchtv/twirp v8.1.3+incompatible // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect

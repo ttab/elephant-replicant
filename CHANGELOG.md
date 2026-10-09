@@ -53,6 +53,13 @@ A given-up target stays stopped until the process restarts or the target is
 reconfigured or started again over the API; `pg_job_lock_restarts_total` and
 `pg_job_lock_held` are the signals. (#69)
 
+**Deploy order (source and target repositories):** the replicant now calls the
+source repository and every target repository on their Connect paths, through
+the generated `repositoryconnect` client. **Every repository it talks to must
+run elephant-repository v1.9.0 or later**, which is what serves those paths;
+against an older one every call fails with `not_found`-shaped HTTP 404s and
+replication stops. Both the prod source and the stage target run v1.9.1 today.
+
 **Behaviour change (target notifications):** the `LISTEN` that carries
 target changes between replicas is now health-checked: the subscriber sends
 itself a ping every five minutes and reconnects when seven minutes pass
@@ -75,10 +82,19 @@ are unaffected.
 Changes:
 
 - Connect is served alongside Twirp on `/elephant.replicant.Replication/`.
-  The Twirp errors the handlers return are translated for the Connect mount
-  until the handlers move to the `elephantine/rpc` vocabulary, and
-  `TestErrorParity` holds the two mounts to the same code, message and
-  metadata for the error paths answered before storage is touched.
+  The handlers construct their errors with the `elephantine/rpc` helpers and
+  the Twirp mount translates them back, so a Twirp caller sees the same code,
+  message and `meta` map as before. `TestErrorParity` holds the two mounts to
+  the same code, message and metadata for the error paths answered before
+  storage is touched, and `TestErrorBodies` pins the raw JSON error body of
+  each.
+- Every handler error now carries an RPC code. A failed query, a marshalling
+  failure or an encryption failure, which Twirp reported as `internal`, is
+  `internal` explicitly on both stacks; no code changed for a Twirp caller.
+- The source and target repository clients are built from the Connect
+  constructors, and the worker reads error codes with `rpc.IsCode`, which
+  recognises both error types. A not found or a lock conflict from a
+  repository is classified exactly as before.
 - The default allowed CORS request headers gain `Connect-Protocol-Version`
   and `Connect-Timeout-Ms`.
 - `rpc_protocol_responses_total{service,method,protocol,code,client_id}` is
