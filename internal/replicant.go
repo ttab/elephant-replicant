@@ -60,6 +60,19 @@ var (
 	ErrConflict = errors.New("document has been updated in target")
 )
 
+// subscriberRetryOptions restarts the LISTEN subscriber about every five
+// seconds for as long as it keeps failing. The subscriber reconnects by itself
+// on a ping timeout and returns only on other connection errors, such as a
+// failover resetting the connection; those are worth retrying rather than
+// taking the process down, and a flat five seconds keeps the outage short
+// where the library's curve would back off towards a minute. GiveUpAfter is
+// left at zero, so it never gives up.
+var subscriberRetryOptions = elephantine.RetryOptions{
+	BackoffFloor: 5 * time.Second,
+	BackoffCeil:  5 * time.Second,
+	MinRuntime:   5 * time.Second,
+}
+
 type AttachmentRef struct {
 	DocType string
 	Name    string
@@ -136,13 +149,20 @@ func Run(ctx context.Context, p Parameters) error {
 		return manager.Run(grace.CancelOnStop(ctx), notifications)
 	})
 
-	group.Go("pg-subscribe", func(ctx context.Context) error {
-		// LISTEN on the direct pool: session-level LISTEN is
-		// incompatible with transaction pooling.
-		pg.Subscribe(grace.CancelOnStop(ctx), p.Logger, p.ListenDatabase, fanOut) //nolint:staticcheck
+	// LISTEN on the direct pool: session-level LISTEN is incompatible with
+	// transaction pooling. The pings that prove the connection alive travel
+	// through the query pool instead, since NOTIFY is fine through a
+	// pooler and the LISTEN pool is two connections behind a bouncer. A
+	// notification published while the connection was dead is lost, so
+	// every connect and reconnect reconciles the workers with the table.
+	subscriber := pg.NewSubscriber(p.Logger, p.ListenDatabase,
+		[]pg.ChannelSubscription{fanOut},
+		pg.WithPingDB(p.Database),
+		pg.WithOnReconnect(manager.Reconcile),
+	)
 
-		return nil
-	})
+	group.GoWithRetries("pg-subscribe", subscriberRetryOptions,
+		stopScoped(grace, subscriber.Run))
 
 	group.Go("server", func(ctx context.Context) error {
 		return p.Server.ListenAndServe(grace.CancelOnQuit(ctx))
@@ -153,6 +173,25 @@ func Run(ctx context.Context, p Parameters) error {
 	})
 
 	return group.Wait() //nolint: wrapcheck
+}
+
+// stopScoped runs fn with a context that is cancelled when a graceful stop is
+// requested, and treats a return caused by that stop as a clean exit rather
+// than a task failure.
+func stopScoped(
+	grace *elephantine.GracefulShutdown,
+	fn func(ctx context.Context) error,
+) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		stopCtx := grace.CancelOnStop(ctx)
+
+		err := fn(stopCtx)
+		if err != nil && stopCtx.Err() == nil {
+			return err
+		}
+
+		return nil
+	}
 }
 
 func registerDefaultTarget(ctx context.Context, p Parameters) error {

@@ -53,6 +53,19 @@ A given-up target stays stopped until the process restarts or the target is
 reconfigured or started again over the API; `pg_job_lock_restarts_total` and
 `pg_job_lock_held` are the signals. (#69)
 
+**Behaviour change (target notifications):** the `LISTEN` that carries
+target changes between replicas is now health-checked: the subscriber sends
+itself a ping every five minutes and reconnects when seven minutes pass
+without one, where before a connection that died silently was never noticed
+and every `ConfigureTarget`, `ChangeTargetState` and `RemoveTarget` after it
+was lost on that replica until a restart. On every connect and reconnect the
+service reconciles its workers with the `replication_target` table, starting
+the enabled targets that have no worker and stopping the ones that are
+disabled or gone, so a start, stop or remove issued while the connection was
+dead takes effect within about twelve minutes. A `ConfigureTarget` whose row
+changed while the worker kept running is still not detected across that gap;
+issue it again. `GetTargetState` is the check.
+
 **Build:** the module's `go` directive is `1.27.2` and the release image
 builds on `golang:1.27.2-alpine3.24` on top of `alpine:3.24`, up from Go
 1.26.4 and Alpine 3.23. The plaintext listener serves HTTP/2 alongside
@@ -73,6 +86,9 @@ Changes:
   what says its Twirp callers have moved.
 - The startup log line `created connection pools` reports `bouncer` from the
   pool setup instead of `separate_pubsub_pool`. (#70)
+- The subscriber is `pg.NewSubscriber`, with the pings sent through the query
+  pool, and is restarted every five seconds for as long as it fails rather
+  than taking the process down; the deprecated `pg.Subscribe` is gone.
 - Pool metrics are exported as `pgxpool_*{pool="main"}`, plus `pool="pubsub"`
   when the LISTEN pool is separate, and the job lock metrics `pg_job_lock_held`
   and `pg_job_lock_transitions_total` carry one series per target. (#69)

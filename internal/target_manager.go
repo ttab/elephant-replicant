@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -50,6 +51,10 @@ type TargetManager struct {
 
 	mu      sync.Mutex
 	workers map[string]*targetWorker
+	// runCtx is the context Run was given, which every worker is started
+	// from. Reconcile needs it so that a worker it starts outlives the
+	// subscriber's connection attempt that called it.
+	runCtx context.Context
 }
 
 // NewTargetManager creates a new target manager.
@@ -75,18 +80,13 @@ func NewTargetManager(
 func (tm *TargetManager) Run(
 	ctx context.Context, notifications <-chan TargetNotification,
 ) error {
-	q := postgres.New(tm.db)
+	tm.mu.Lock()
+	tm.runCtx = ctx
+	tm.mu.Unlock()
 
-	targets, err := q.ListEnabledTargets(ctx)
+	err := tm.Reconcile(ctx)
 	if err != nil {
-		return fmt.Errorf("list enabled targets: %w", err)
-	}
-
-	tm.logger.Info("found enabled targets", "count", len(targets))
-
-	for _, t := range targets {
-		tm.logger.Info("starting worker", "target", t.Name)
-		tm.startWorker(ctx, t.Name)
+		return err
 	}
 
 	for {
@@ -99,6 +99,71 @@ func (tm *TargetManager) Run(
 			tm.handleNotification(ctx, n)
 		}
 	}
+}
+
+// Reconcile brings the running workers in step with the table: it starts a
+// worker for every enabled target that has none and stops the workers of
+// targets that are disabled or gone. Run calls it on start, and the LISTEN
+// subscriber calls it before its first listen and after every reconnect,
+// since a notification published while the connection was dead is lost. A
+// target whose row changed while its worker kept running is not detected;
+// that is what a repeated ConfigureTarget is for.
+//
+// Before Run has started, there is nothing to reconcile against and Run will
+// do the first pass itself.
+func (tm *TargetManager) Reconcile(ctx context.Context) error {
+	tm.mu.Lock()
+	runCtx := tm.runCtx
+	tm.mu.Unlock()
+
+	if runCtx == nil {
+		return nil
+	}
+
+	targets, err := postgres.New(tm.db).ListEnabledTargets(ctx)
+	if err != nil {
+		return fmt.Errorf("list enabled targets: %w", err)
+	}
+
+	enabled := make(map[string]bool, len(targets))
+
+	for _, t := range targets {
+		enabled[t.Name] = true
+	}
+
+	tm.mu.Lock()
+	running := slices.Collect(maps.Keys(tm.workers))
+	tm.mu.Unlock()
+
+	var started, stopped int
+
+	for _, name := range running {
+		if enabled[name] {
+			continue
+		}
+
+		tm.logger.Info("stopping worker for a target that is no longer enabled",
+			"target", name)
+		tm.stopWorker(name)
+
+		stopped++
+	}
+
+	for _, t := range targets {
+		if tm.startWorker(runCtx, t.Name) {
+			tm.logger.Info("starting worker", "target", t.Name)
+
+			started++
+		}
+	}
+
+	tm.logger.Info("reconciled workers with the enabled targets",
+		"enabled", len(targets),
+		"started", started,
+		"stopped", stopped,
+	)
+
+	return nil
 }
 
 func (tm *TargetManager) handleNotification(
@@ -122,12 +187,14 @@ func (tm *TargetManager) handleNotification(
 	}
 }
 
-func (tm *TargetManager) startWorker(ctx context.Context, name string) {
+// startWorker starts a worker for the target unless one is running, and
+// reports whether it did.
+func (tm *TargetManager) startWorker(ctx context.Context, name string) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	if _, exists := tm.workers[name]; exists {
-		return
+		return false
 	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -152,6 +219,8 @@ func (tm *TargetManager) startWorker(ctx context.Context, name string) {
 		// started again.
 		tm.forgetWorker(name, tw)
 	}()
+
+	return true
 }
 
 func (tm *TargetManager) runWorker(ctx context.Context, name string) {
