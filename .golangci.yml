@@ -62,8 +62,6 @@ linters:
         # The elephantine/rpc helpers construct RPC errors. Wrapping one would
         # bury the code the handler picked, which is the whole point of it.
         - github.com/ttab/elephantine/rpc.
-        - elephantine.InvalidArgumentf(
-        - elephantine.RequireAnyScope(
         - (context.Context).Err(
         - github.com/ttab/elephantine/pg.WithTX(
   exclusions:
@@ -78,13 +76,6 @@ linters:
       - linters:
           - wrapcheck
         path: _test\.go
-      # elephantine deprecated its Twirp error and scope helpers in favour of
-      # the connect.Error returning ones in elephantine/rpc. The replicant
-      # handlers still return Twirp errors, which the Connect mount translates
-      # on the way out; the exclusion goes with the move to rpc errors.
-      - linters:
-          - staticcheck
-        text: "SA1019: github.com/ttab/elephantine.(RequireAnyScope|InvalidArgumentf|IsTwirpErrorCode) is deprecated"
     presets:
       - comments
       - common-false-positives
