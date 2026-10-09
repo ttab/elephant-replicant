@@ -60,18 +60,17 @@ var (
 	ErrConflict = errors.New("document has been updated in target")
 )
 
-// subscriberRetryOptions restarts the LISTEN subscriber about every five
-// seconds for as long as it keeps failing. The subscriber reconnects by itself
-// on a ping timeout and returns only on other connection errors, such as a
-// failover resetting the connection; those are worth retrying rather than
-// taking the process down, and a flat five seconds keeps the outage short
-// where the library's curve would back off towards a minute. GiveUpAfter is
-// left at zero, so it never gives up.
-var subscriberRetryOptions = elephantine.RetryOptions{
-	BackoffFloor: 5 * time.Second,
-	BackoffCeil:  5 * time.Second,
-	MinRuntime:   5 * time.Second,
-}
+// subscriberRetryOptions restarts the LISTEN subscriber for as long as it
+// keeps failing, on the library's default curve: one second growing to a
+// minute, never giving up. The subscriber reconnects by itself on a ping
+// timeout and returns only on other connection errors, such as a failover
+// resetting the connection or the direct pool being unreachable; those are
+// worth retrying rather than taking the process down, since the workers do
+// not depend on notifications to replicate. Nothing here waits on a
+// notification either, so unlike elephant-user there is no reason to pin the
+// backoff flat: a direct pool that stays unreachable logs a restart once a
+// minute rather than every five seconds.
+var subscriberRetryOptions = elephantine.RetryOptions{}
 
 type AttachmentRef struct {
 	DocType string
@@ -150,14 +149,14 @@ func Run(ctx context.Context, p Parameters) error {
 	})
 
 	// LISTEN on the direct pool: session-level LISTEN is incompatible with
-	// transaction pooling. The pings that prove the connection alive travel
-	// through the query pool instead, since NOTIFY is fine through a
-	// pooler and the LISTEN pool is two connections behind a bouncer. A
-	// notification published while the connection was dead is lost, so
-	// every connect and reconnect reconciles the workers with the table.
+	// transaction pooling. The pings that prove the connection alive go
+	// through the same pool, as in the rest of the fleet, so that the
+	// health of the direct connection is never judged through the
+	// bouncer. A notification published while the connection was dead is
+	// lost, so every connect and reconnect reconciles the workers with the
+	// table.
 	subscriber := pg.NewSubscriber(p.Logger, p.ListenDatabase,
 		[]pg.ChannelSubscription{fanOut},
-		pg.WithPingDB(p.Database),
 		pg.WithOnReconnect(manager.Reconcile),
 	)
 

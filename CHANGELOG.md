@@ -86,9 +86,9 @@ Changes:
   what says its Twirp callers have moved.
 - The startup log line `created connection pools` reports `bouncer` from the
   pool setup instead of `separate_pubsub_pool`. (#70)
-- The subscriber is `pg.NewSubscriber`, with the pings sent through the query
-  pool, and is restarted every five seconds for as long as it fails rather
-  than taking the process down; the deprecated `pg.Subscribe` is gone.
+- The subscriber is `pg.NewSubscriber` on the direct pool, pings included,
+  and is restarted with backoff for as long as it fails rather than taking
+  the process down; the deprecated `pg.Subscribe` is gone.
 - Pool metrics are exported as `pgxpool_*{pool="main"}`, plus `pool="pubsub"`
   when the LISTEN pool is separate, and the job lock metrics `pg_job_lock_held`
   and `pg_job_lock_transitions_total` carry one series per target. (#69)
