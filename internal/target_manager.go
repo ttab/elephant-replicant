@@ -51,10 +51,10 @@ type TargetManager struct {
 
 	mu      sync.Mutex
 	workers map[string]*targetWorker
-	// runCtx is the context Run was given, which every worker is started
-	// from. Reconcile needs it so that a worker it starts outlives the
-	// subscriber's connection attempt that called it.
-	runCtx context.Context
+
+	// reconcileReq carries reconcile requests into Run's loop. It has one
+	// slot, so requests that arrive while one is pending coalesce.
+	reconcileReq chan struct{}
 }
 
 // NewTargetManager creates a new target manager.
@@ -72,6 +72,7 @@ func NewTargetManager(
 		logMetrics:    logMetrics,
 		encryptionKey: encryptionKey,
 		workers:       make(map[string]*targetWorker),
+		reconcileReq:  make(chan struct{}, 1),
 	}
 }
 
@@ -80,15 +81,16 @@ func NewTargetManager(
 func (tm *TargetManager) Run(
 	ctx context.Context, notifications <-chan TargetNotification,
 ) error {
-	tm.mu.Lock()
-	tm.runCtx = ctx
-	tm.mu.Unlock()
-
-	err := tm.Reconcile(ctx)
+	err := tm.reconcile(ctx)
 	if err != nil {
 		return err
 	}
 
+	// Workers are started and stopped from this loop and nowhere else, so
+	// a reconcile and a notification never interleave: each runs to
+	// completion before the next is handled. That is what keeps a
+	// reconcile from stopping a worker that a notification started between
+	// its read of the table and its read of the worker map.
 	for {
 		select {
 		case <-ctx.Done():
@@ -97,29 +99,50 @@ func (tm *TargetManager) Run(
 			return ctx.Err()
 		case n := <-notifications:
 			tm.handleNotification(ctx, n)
+		case <-tm.reconcileReq:
+			err := tm.reconcile(ctx)
+			if err != nil {
+				tm.logger.ErrorContext(ctx,
+					"reconcile workers with the enabled targets",
+					elephantine.LogKeyError, err)
+
+				// The request came from a reconnect, so nothing
+				// else will ask again until the next one. Retry
+				// shortly rather than leave the workers stale.
+				time.AfterFunc(reconcileRetryDelay, tm.requestReconcile)
+			}
 		}
 	}
 }
 
-// Reconcile brings the running workers in step with the table: it starts a
-// worker for every enabled target that has none and stops the workers of
-// targets that are disabled or gone. Run calls it on start, and the LISTEN
-// subscriber calls it before its first listen and after every reconnect,
-// since a notification published while the connection was dead is lost. A
-// target whose row changed while its worker kept running is not detected;
-// that is what a repeated ConfigureTarget is for.
-//
-// Before Run has started, there is nothing to reconcile against and Run will
-// do the first pass itself.
-func (tm *TargetManager) Reconcile(ctx context.Context) error {
-	tm.mu.Lock()
-	runCtx := tm.runCtx
-	tm.mu.Unlock()
+// reconcileRetryDelay is how long a failed reconcile waits before it is
+// requested again.
+const reconcileRetryDelay = 10 * time.Second
 
-	if runCtx == nil {
-		return nil
+// RequestReconcile asks Run to bring the running workers in step with the
+// table. The LISTEN subscriber calls it before its first listen and after
+// every reconnect, since a notification published while the connection was
+// dead is lost. It never blocks and never fails: the request is queued for
+// Run's loop, and one that arrives while another is pending is folded into
+// it. A reconcile requested before Run has started is served when it does.
+func (tm *TargetManager) RequestReconcile(_ context.Context) error {
+	tm.requestReconcile()
+
+	return nil
+}
+
+func (tm *TargetManager) requestReconcile() {
+	select {
+	case tm.reconcileReq <- struct{}{}:
+	default:
 	}
+}
 
+// reconcile starts a worker for every enabled target that has none and stops
+// the workers of targets that are disabled or gone. A target whose row
+// changed while its worker kept running is not detected; that is what a
+// repeated ConfigureTarget is for. It is only called from Run's loop.
+func (tm *TargetManager) reconcile(ctx context.Context) error {
 	targets, err := postgres.New(tm.db).ListEnabledTargets(ctx)
 	if err != nil {
 		return fmt.Errorf("list enabled targets: %w", err)
@@ -150,7 +173,7 @@ func (tm *TargetManager) Reconcile(ctx context.Context) error {
 	}
 
 	for _, t := range targets {
-		if tm.startWorker(runCtx, t.Name) {
+		if tm.startWorker(ctx, t.Name) {
 			tm.logger.Info("starting worker", "target", t.Name)
 
 			started++

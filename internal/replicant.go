@@ -152,11 +152,12 @@ func Run(ctx context.Context, p Parameters) error {
 	// through the same pool, as in the rest of the fleet, so that the
 	// health of the direct connection is never judged through the
 	// bouncer. A notification published while the connection was dead is
-	// lost, so every connect and reconnect reconciles the workers with the
-	// table.
+	// lost, so every connect and reconnect asks the manager to reconcile
+	// the workers with the table; the manager runs that in its own loop,
+	// in order with the notifications.
 	subscriber := pg.NewSubscriber(p.Logger, p.ListenDatabase,
 		[]pg.ChannelSubscription{fanOut},
-		pg.WithOnReconnect(manager.Reconcile),
+		pg.WithOnReconnect(manager.RequestReconcile),
 	)
 
 	group.GoWithRetries("pg-subscribe", subscriberRetryOptions,
