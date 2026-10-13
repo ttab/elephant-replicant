@@ -1,0 +1,10 @@
+{
+  "status": 403,
+  "body": {
+    "code": "permission_denied",
+    "meta": {
+      "required_any_of_scopes": "doc_admin"
+    },
+    "msg": "missing required scope"
+  }
+}

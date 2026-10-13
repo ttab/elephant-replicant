@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.23 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.24 AS build
 
 WORKDIR /usr/src
 
@@ -14,7 +14,7 @@ RUN GOOS=$TARGETOS GOARCH=$TARGETARCH \
       -ldflags "-X main.version=$VERSION" \
       -o /build/replicant ./cmd/replicant
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 COPY --from=build /build/replicant /usr/local/bin/replicant
 

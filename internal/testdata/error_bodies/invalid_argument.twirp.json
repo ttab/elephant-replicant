@@ -1,0 +1,10 @@
+{
+  "status": 400,
+  "body": {
+    "code": "invalid_argument",
+    "meta": {
+      "argument": "name"
+    },
+    "msg": "name must not be empty"
+  }
+}

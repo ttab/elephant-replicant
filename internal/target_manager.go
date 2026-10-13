@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -49,6 +51,10 @@ type TargetManager struct {
 
 	mu      sync.Mutex
 	workers map[string]*targetWorker
+
+	// reconcileReq carries reconcile requests into Run's loop. It has one
+	// slot, so requests that arrive while one is pending coalesce.
+	reconcileReq chan struct{}
 }
 
 // NewTargetManager creates a new target manager.
@@ -66,6 +72,7 @@ func NewTargetManager(
 		logMetrics:    logMetrics,
 		encryptionKey: encryptionKey,
 		workers:       make(map[string]*targetWorker),
+		reconcileReq:  make(chan struct{}, 1),
 	}
 }
 
@@ -74,30 +81,112 @@ func NewTargetManager(
 func (tm *TargetManager) Run(
 	ctx context.Context, notifications <-chan TargetNotification,
 ) error {
-	q := postgres.New(tm.db)
-
-	targets, err := q.ListEnabledTargets(ctx)
+	err := tm.reconcile(ctx)
 	if err != nil {
-		return fmt.Errorf("list enabled targets: %w", err)
+		return err
 	}
 
-	tm.logger.Info("found enabled targets", "count", len(targets))
-
-	for _, t := range targets {
-		tm.logger.Info("starting worker", "target", t.Name)
-		tm.startWorker(ctx, t.Name)
-	}
-
+	// Workers are started and stopped from this loop and nowhere else, so
+	// a reconcile and a notification never interleave: each runs to
+	// completion before the next is handled. That is what keeps a
+	// reconcile from stopping a worker that a notification started between
+	// its read of the table and its read of the worker map.
 	for {
 		select {
 		case <-ctx.Done():
 			tm.stopAll()
 
-			return ctx.Err() //nolint: wrapcheck
+			return ctx.Err()
 		case n := <-notifications:
 			tm.handleNotification(ctx, n)
+		case <-tm.reconcileReq:
+			err := tm.reconcile(ctx)
+			if err != nil {
+				tm.logger.ErrorContext(ctx,
+					"reconcile workers with the enabled targets",
+					elephantine.LogKeyError, err)
+
+				// The request came from a reconnect, so nothing
+				// else will ask again until the next one. Retry
+				// shortly rather than leave the workers stale.
+				time.AfterFunc(reconcileRetryDelay, tm.requestReconcile)
+			}
 		}
 	}
+}
+
+// reconcileRetryDelay is how long a failed reconcile waits before it is
+// requested again.
+const reconcileRetryDelay = 10 * time.Second
+
+// RequestReconcile asks Run to bring the running workers in step with the
+// table. The LISTEN subscriber calls it before its first listen and after
+// every reconnect, since a notification published while the connection was
+// dead is lost. It never blocks and never fails: the request is queued for
+// Run's loop, and one that arrives while another is pending is folded into
+// it. A reconcile requested before Run has started is served when it does.
+func (tm *TargetManager) RequestReconcile(_ context.Context) error {
+	tm.requestReconcile()
+
+	return nil
+}
+
+func (tm *TargetManager) requestReconcile() {
+	select {
+	case tm.reconcileReq <- struct{}{}:
+	default:
+	}
+}
+
+// reconcile starts a worker for every enabled target that has none and stops
+// the workers of targets that are disabled or gone. A target whose row
+// changed while its worker kept running is not detected; that is what a
+// repeated ConfigureTarget is for. It is only called from Run's loop.
+func (tm *TargetManager) reconcile(ctx context.Context) error {
+	targets, err := postgres.New(tm.db).ListEnabledTargets(ctx)
+	if err != nil {
+		return fmt.Errorf("list enabled targets: %w", err)
+	}
+
+	enabled := make(map[string]bool, len(targets))
+
+	for _, t := range targets {
+		enabled[t.Name] = true
+	}
+
+	tm.mu.Lock()
+	running := slices.Collect(maps.Keys(tm.workers))
+	tm.mu.Unlock()
+
+	var started, stopped int
+
+	for _, name := range running {
+		if enabled[name] {
+			continue
+		}
+
+		tm.logger.Info("stopping worker for a target that is no longer enabled",
+			"target", name)
+		tm.stopWorker(name)
+
+		stopped++
+	}
+
+	for _, t := range targets {
+		if tm.startWorker(ctx, t.Name) {
+			tm.logger.Info("starting worker", "target", t.Name)
+
+			started++
+		}
+	}
+
+	tm.logger.Info("reconciled workers with the enabled targets",
+		"enabled", len(targets),
+		"started", started,
+		"stopped", stopped,
+	)
+
+	return nil
 }
 
 func (tm *TargetManager) handleNotification(
@@ -121,12 +210,14 @@ func (tm *TargetManager) handleNotification(
 	}
 }
 
-func (tm *TargetManager) startWorker(ctx context.Context, name string) {
+// startWorker starts a worker for the target unless one is running, and
+// reports whether it did.
+func (tm *TargetManager) startWorker(ctx context.Context, name string) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	if _, exists := tm.workers[name]; exists {
-		return
+		return false
 	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -151,6 +242,8 @@ func (tm *TargetManager) startWorker(ctx context.Context, name string) {
 		// started again.
 		tm.forgetWorker(name, tw)
 	}()
+
+	return true
 }
 
 func (tm *TargetManager) runWorker(ctx context.Context, name string) {
@@ -295,11 +388,7 @@ func (tm *TargetManager) stopWorker(name string) {
 
 func (tm *TargetManager) stopAll() {
 	tm.mu.Lock()
-	workers := make(map[string]*targetWorker, len(tm.workers))
-
-	for k, v := range tm.workers {
-		workers[k] = v
-	}
+	workers := maps.Clone(tm.workers)
 
 	tm.workers = make(map[string]*targetWorker)
 

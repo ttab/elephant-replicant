@@ -15,13 +15,14 @@ linters:
     - godox
     - goheader
     - gomoddirectives
-    - gomodguard
+    - gomodguard_v2
     - goprintffuncname
     - gosec
     - importas
     - lll
     - makezero
     - misspell
+    - modernize
     - nakedret
     - nestif
     - nilnil
@@ -40,34 +41,55 @@ linters:
     - wrapcheck
     - wsl_v5
   settings:
+    goconst:
+      # Test-file issues are already excluded below; don't let test
+      # literals inflate the occurrence counts for production code either.
+      ignore-tests: true
     godox:
       keywords:
         - FIXME
         - BUG
+    modernize:
+      disable:
+        # embedlit suggests eliding the type of an embedded field in a
+        # struct literal, which the Go 1.27 compiler rejects with "missing
+        # type in composite literal".
+        - embedlit
     nestif:
       min-complexity: 6
     wrapcheck:
       extra-ignore-sigs:
+        # The elephantine/rpc helpers construct RPC errors. Wrapping one would
+        # bury the code the handler picked, which is the whole point of it.
+        - github.com/ttab/elephantine/rpc.
         - elephantine.InvalidArgumentf(
         - elephantine.RequireAnyScope(
-        - howdah.NewHTTPError
-        - howdah.HTTPErrorf
-        - .RequireAuth(
+        - (context.Context).Err(
+        - github.com/ttab/elephantine/pg.WithTX(
   exclusions:
     generated: lax
+    rules:
+      - linters:
+          - goconst
+          - gosec
+        path: _test\.go
+      # A test that checks what the server answered passes the RPC error
+      # through verbatim; wrapping it would only get in the way.
+      - linters:
+          - wrapcheck
+        path: _test\.go
+      # elephantine deprecated its Twirp error and scope helpers in favour of
+      # the connect.Error returning ones in elephantine/rpc. The replicant
+      # handlers still return Twirp errors, which the Connect mount translates
+      # on the way out; the exclusion goes with the move to rpc errors.
+      - linters:
+          - staticcheck
+        text: "SA1019: github.com/ttab/elephantine.(RequireAnyScope|InvalidArgumentf|IsTwirpErrorCode) is deprecated"
     presets:
       - comments
       - common-false-positives
       - legacy
       - std-error-handling
-    rules:
-      # elephantine deprecated its Twirp error and scope helpers in favour of
-      # the connect.Error returning ones in elephantine/rpc. The replicant is
-      # still a Twirp service, so the Twirp shaped errors are the ones its
-      # handlers have to return; these go with the Twirp mount, not before it.
-      - linters:
-          - staticcheck
-        text: "SA1019: github.com/ttab/elephantine.(RequireAnyScope|InvalidArgumentf|IsTwirpErrorCode) is deprecated"
     paths:
       - third_party$
       - builtin$

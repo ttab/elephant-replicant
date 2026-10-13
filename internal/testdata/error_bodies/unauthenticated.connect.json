@@ -1,0 +1,7 @@
+{
+  "status": 401,
+  "body": {
+    "code": "unauthenticated",
+    "message": "authentication required"
+  }
+}
