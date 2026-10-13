@@ -11,7 +11,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/ttab/elephant-api/repository"
+	"github.com/ttab/elephant-api/repository/repositoryconnect"
 	"github.com/ttab/elephant-replicant/internal"
 	"github.com/ttab/elephantine"
 	"github.com/ttab/elephantine/pg"
@@ -286,8 +286,8 @@ func runReplicant(ctx context.Context, c *cli.Command) error {
 
 	elephantClient := oauth2.NewClient(ctx, auth.TokenSource)
 
-	documents := repository.NewDocumentsProtobufClient(
-		repositoryEndpoint, elephantClient,
+	documents := repositoryconnect.NewDocumentsServiceClient(
+		elephantClient, repositoryEndpoint,
 	)
 
 	serverOpts := []elephantine.APIServerOption{
