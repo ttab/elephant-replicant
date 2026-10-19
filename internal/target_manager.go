@@ -121,9 +121,9 @@ func (tm *TargetManager) Run(
 const reconcileRetryDelay = 10 * time.Second
 
 // RequestReconcile asks Run to bring the running workers in step with the
-// table. The LISTEN subscriber calls it before its first listen and after
-// every reconnect, since a notification published while the connection was
-// dead is lost. It never blocks and never fails: the request is queued for
+// table. The LISTEN subscriber calls it once its LISTEN is in place, on the
+// first connect and after every reconnect, since a notification published
+// while the connection was dead is lost. It never blocks and never fails: the request is queued for
 // Run's loop, and one that arrives while another is pending is folded into
 // it. A reconcile requested before Run has started is served when it does.
 func (tm *TargetManager) RequestReconcile(_ context.Context) error {
