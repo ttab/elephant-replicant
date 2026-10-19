@@ -4,7 +4,7 @@ All notable changes to this project after v1.0.0 are documented here. The
 entries below are derived from release tags; see the linked PRs for full
 detail.
 
-## [v1.4.1] - Unreleased
+## [v1.4.1] - 2026-10-19
 
 Changes:
 
@@ -12,10 +12,10 @@ Changes:
   reconciling its workers after a `LISTEN` reconnect is no longer lost:
   elephantine v0.30.4 issues the `LISTEN` before it runs the reconnect hook,
   so the notification is queued on the connection and handled right after
-  the reconcile.
+  the reconcile. (#75)
 - Dependency upgrades: elephantine to v0.30.4, elephant-api to v0.28.2,
   connect to v1.21.1, ttab/mage to v0.16.1 and the x/ modules. CI lints
-  with golangci-lint v2.15.
+  with golangci-lint v2.15. (#75)
 
 ## [v1.4.0] - 2026-10-13
 
