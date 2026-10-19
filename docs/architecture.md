@@ -170,11 +170,12 @@ as in every other elephant service, so the health of the direct connection is
 never judged through the bouncer.
 
 **A notification published while the connection was dead is gone.** To
-cover that, the subscriber calls `TargetManager.RequestReconcile` before its
-first listen and after every reconnect. The request goes on a one-slot
-channel, and the manager's `Run` loop serves it in the same `select` as the
-notifications: it lists the enabled targets, starts a worker for each that
-has none, and stops the workers of targets that are disabled or removed.
+cover that, the subscriber calls `TargetManager.RequestReconcile` once its
+`LISTEN` is in place, on the first connect and after every reconnect. The
+request goes on a one-slot channel, and the manager's `Run` loop serves it in
+the same `select` as the notifications: it lists the enabled targets, starts
+a worker for each that has none, and stops the workers of targets that are
+disabled or removed.
 **One goroutine starts and stops workers, so a reconcile and a notification
 never interleave**; each runs to completion before the next is handled, which
 is what stops a reconcile from undoing a start that a notification made
@@ -184,13 +185,12 @@ that fails on the database is logged and requested again ten seconds later.
 `Run` is up is served when it starts.
 
 A `start`, `stop` or `remove` lost in the gap therefore takes effect at the
-reconnect, with one exception: elephantine calls the reconnect hook before it
-issues `LISTEN`, so a notification published in the instant between the
-reconcile's query and the `LISTEN` is lost until the next reconnect. Moving
-the hook after the `LISTEN` is a change in elephantine. A `configure` whose
-row changed under a worker that kept running is the case reconciliation
-cannot see at all, since nothing distinguishes a changed row from an
-unchanged one; issuing `ConfigureTarget` again is the fix, and
+reconnect. One published while the reconcile is running is queued on the
+connection, since the `LISTEN` is already issued when the hook runs, and is
+delivered as soon as the reconcile returns. A `configure` whose row changed
+under a worker that kept running is the case reconciliation cannot see at
+all, since nothing distinguishes a changed row from an unchanged one; issuing
+`ConfigureTarget` again is the fix, and
 `GetTargetState` is the check.
 
 ### The job lock

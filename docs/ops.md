@@ -239,10 +239,9 @@ The notification did not arrive: the `LISTEN` connection was dead when it was
 published. The subscriber detects that within twelve minutes (a ping every
 five minutes, seven minutes of grace) and reconnects, and on reconnect it
 reconciles the workers with the table, so a lost `start`, `stop` or `remove`
-heals itself by then, unless it was published in the instant between the
-reconcile and the `LISTEN`, which loses it until the next reconnect. A lost
-`configure` does not heal: the worker keeps running on the old row, and
-nothing can tell a changed row from an unchanged one.
+heals itself by then. A lost `configure` does not heal: the worker keeps
+running on the old row, and nothing can tell a changed row from an unchanged
+one.
 
 * Signal: no `received target notification` log line after the call, and
   `GetTargetState` or the worker's behaviour disagreeing with the row. A

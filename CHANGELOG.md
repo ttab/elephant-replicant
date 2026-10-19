@@ -4,6 +4,17 @@ All notable changes to this project after v1.0.0 are documented here. The
 entries below are derived from release tags; see the linked PRs for full
 detail.
 
+## [v1.4.1] - Unreleased
+
+Changes:
+
+- A `ChangeTargetState` or `RemoveTarget` published while the service was
+  reconciling its workers after a `LISTEN` reconnect is no longer lost:
+  elephantine v0.30.4 issues the `LISTEN` before it runs the reconnect hook,
+  so the notification is queued on the connection and handled right after
+  the reconcile.
+- Dependency upgrades: elephantine to v0.30.4.
+
 ## [v1.4.0] - 2026-10-13
 
 **New API surface (Connect):** every method of `elephant.replicant.Replication`
