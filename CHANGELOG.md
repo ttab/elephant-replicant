@@ -13,7 +13,9 @@ Changes:
   elephantine v0.30.4 issues the `LISTEN` before it runs the reconnect hook,
   so the notification is queued on the connection and handled right after
   the reconcile.
-- Dependency upgrades: elephantine to v0.30.4.
+- Dependency upgrades: elephantine to v0.30.4, elephant-api to v0.28.2,
+  connect to v1.21.1, ttab/mage to v0.16.1 and the x/ modules. CI lints
+  with golangci-lint v2.15.
 
 ## [v1.4.0] - 2026-10-13
 
