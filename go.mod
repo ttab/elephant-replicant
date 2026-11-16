@@ -15,7 +15,7 @@ require (
 	github.com/ttab/mage v0.16.1
 	github.com/ttab/newsdoc v1.1.0
 	github.com/urfave/cli/v3 v3.14.0
-	golang.org/x/oauth2 v0.37.0
+	golang.org/x/oauth2 v0.38.0
 )
 
 require (
