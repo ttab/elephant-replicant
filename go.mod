@@ -12,7 +12,7 @@ require (
 	github.com/ttab/elephant-api v0.28.2
 	github.com/ttab/elephantine v0.30.4
 	github.com/ttab/koonkie v0.2.0
-	github.com/ttab/mage v0.16.1
+	github.com/ttab/mage v0.17.0
 	github.com/ttab/newsdoc v1.1.0
 	github.com/urfave/cli/v3 v3.14.0
 	golang.org/x/oauth2 v0.37.0
